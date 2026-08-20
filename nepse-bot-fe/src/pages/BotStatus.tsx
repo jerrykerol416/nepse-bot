@@ -1,103 +1,141 @@
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
 import { fetchBotStatus, fetchBotTrades } from "../api/market";
-import { cn, formatNumber } from "../lib/utils";
+import { formatNumber, formatDate, percentColor } from "../lib/utils";
+
+interface Bot {
+  name: string;
+  status: string;
+  strategy: string;
+  last_run?: string;
+  trades_today?: number;
+  pnl?: number;
+}
+
+interface Trade {
+  id: string;
+  symbol: string;
+  action: "BUY" | "SELL";
+  quantity: number;
+  price: number;
+  timestamp: string;
+  bot_name: string;
+  pnl?: number;
+}
 
 export default function BotStatus() {
-  const status = useQuery({ queryKey: ["bot-status"], queryFn: fetchBotStatus });
-  const trades = useQuery({ queryKey: ["bot-trades"], queryFn: fetchBotTrades });
+  const [bots, setBots] = useState<Bot[]>([]);
+  const [trades, setTrades] = useState<Trade[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    Promise.allSettled([fetchBotStatus(), fetchBotTrades()]).then(([b, t]) => {
+      if (b.status === "fulfilled") {
+        const d = b.value;
+        setBots(Array.isArray(d) ? d : d.bots || []);
+      }
+      if (t.status === "fulfilled") setTrades(Array.isArray(t.value) ? t.value : []);
+      setLoading(false);
+    });
+  }, []);
 
   return (
-    <div className="space-y-6">
-      <h2 className="text-xl font-bold text-gray-900">Bot Status</h2>
+    <div>
+      <h1 className="text-xl font-bold text-gray-900 mb-4">Trading Bots</h1>
 
-      {/* Status Cards */}
-      {status.isLoading ? (
-        <div className="bg-white rounded-lg border p-8 text-center text-gray-500">Loading bot status...</div>
-      ) : status.isError ? (
-        <div className="bg-white rounded-lg border p-8 text-center text-red-500">
-          Backend not reachable: {status.error.message}
-        </div>
+      {loading ? (
+        <div className="text-gray-400 py-8 text-center">Loading bot status...</div>
       ) : (
-        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {status.data?.bots?.map((bot: any, i: number) => (
-            <div key={i} className="bg-white rounded-lg border p-4 shadow-sm">
-              <div className="flex items-center justify-between mb-2">
-                <h3 className="font-semibold text-sm text-gray-800">{bot.name || bot.bot_name}</h3>
-                <span
-                  className={cn(
-                    "text-xs px-2 py-0.5 rounded-full font-medium",
-                    bot.active ? "bg-green-100 text-green-700" : "bg-gray-100 text-gray-600"
-                  )}
-                >
-                  {bot.active ? "Active" : "Idle"}
-                </span>
+        <>
+          {/* Bot cards */}
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 mb-6">
+            {bots.length > 0 ? (
+              bots.map((bot) => (
+                <div key={bot.name} className="bg-white rounded-lg border p-4">
+                  <div className="flex items-center gap-2 mb-2">
+                    <span
+                      className={`w-2.5 h-2.5 rounded-full ${
+                        bot.status === "running" ? "bg-green-500 animate-pulse" : "bg-gray-400"
+                      }`}
+                    />
+                    <h3 className="font-semibold text-sm text-gray-800">{bot.name}</h3>
+                  </div>
+                  <div className="text-xs text-gray-500 space-y-1">
+                    <div>Strategy: {bot.strategy}</div>
+                    {bot.last_run && <div>Last run: {bot.last_run}</div>}
+                    {bot.trades_today != null && <div>Trades today: {bot.trades_today}</div>}
+                    {bot.pnl != null && (
+                      <div className={percentColor(bot.pnl)}>
+                        P&L: {bot.pnl > 0 ? "+" : ""}
+                        {formatNumber(bot.pnl)}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div className="col-span-full bg-white rounded-lg border p-4 text-center text-gray-400 text-sm">
+                <p className="mb-1">No bots configured</p>
+                <p className="text-xs">
+                  Bots run during NEPSE hours (11:00-15:00 NST, Sun-Thu) via scheduler
+                </p>
               </div>
-              <div className="text-xs text-gray-500 space-y-1">
-                <p>Timeframe: {bot.timeframe || "daily"}</p>
-                <p>Last run: {bot.last_run || "Never"}</p>
-                {bot.total_signals != null && <p>Signals: {bot.total_signals}</p>}
-              </div>
-            </div>
-          )) || (
-            <div className="col-span-full bg-white rounded-lg border p-6 text-sm text-gray-500">
-              <p className="font-medium text-gray-700 mb-2">Scheduler Status</p>
-              <pre className="text-xs bg-gray-50 rounded p-3 overflow-auto">
-                {JSON.stringify(status.data, null, 2)}
-              </pre>
-            </div>
-          )}
-        </div>
-      )}
+            )}
+          </div>
 
-      {/* Paper Trades */}
-      <div>
-        <h3 className="text-lg font-semibold text-gray-800 mb-3">Recent Paper Trades</h3>
-        {trades.isLoading ? (
-          <div className="text-gray-500 text-sm">Loading...</div>
-        ) : trades.isError ? (
-          <div className="text-red-500 text-sm">Could not load trades</div>
-        ) : trades.data && trades.data.length > 0 ? (
-          <div className="overflow-x-auto rounded-lg border bg-white shadow-sm">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="bg-gray-50 text-left text-xs font-medium text-gray-500 uppercase">
-                  <th className="px-4 py-3">Symbol</th>
-                  <th className="px-4 py-3">Action</th>
-                  <th className="px-4 py-3 text-right">Price</th>
-                  <th className="px-4 py-3 text-right">Qty</th>
-                  <th className="px-4 py-3">Bot</th>
-                  <th className="px-4 py-3">Time</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {trades.data.slice(0, 20).map((t: any, i: number) => (
-                  <tr key={i} className="hover:bg-gray-50">
-                    <td className="px-4 py-2 font-medium text-teal-700">{t.symbol}</td>
-                    <td className="px-4 py-2">
-                      <span
-                        className={cn(
-                          "px-2 py-0.5 rounded text-xs font-medium",
-                          t.action === "BUY" ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
-                        )}
-                      >
-                        {t.action}
-                      </span>
-                    </td>
-                    <td className="px-4 py-2 text-right font-mono">{formatNumber(t.price)}</td>
-                    <td className="px-4 py-2 text-right font-mono">{t.quantity}</td>
-                    <td className="px-4 py-2 text-xs text-gray-500">{t.bot_name}</td>
-                    <td className="px-4 py-2 text-xs text-gray-500">{t.created_at?.slice(0, 16)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          {/* Paper trades */}
+          <div className="bg-white rounded-lg border overflow-hidden">
+            <div className="p-3 border-b">
+              <h2 className="font-semibold text-sm text-gray-800">Paper Trades</h2>
+            </div>
+            {trades.length > 0 ? (
+              <div className="overflow-x-auto max-h-[400px] overflow-y-auto">
+                <table className="w-full text-xs">
+                  <thead className="bg-gray-50 sticky top-0">
+                    <tr>
+                      <th className="px-2 py-1.5 text-left">Time</th>
+                      <th className="px-2 py-1.5 text-left">Bot</th>
+                      <th className="px-2 py-1.5 text-left">Symbol</th>
+                      <th className="px-2 py-1.5 text-center">Action</th>
+                      <th className="px-2 py-1.5 text-right">Qty</th>
+                      <th className="px-2 py-1.5 text-right">Price</th>
+                      <th className="px-2 py-1.5 text-right">P&L</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y">
+                    {trades.map((t, i) => (
+                      <tr key={t.id || i} className="hover:bg-gray-50">
+                        <td className="px-2 py-1">{formatDate(t.timestamp)}</td>
+                        <td className="px-2 py-1">{t.bot_name}</td>
+                        <td className="px-2 py-1 font-medium text-teal-700">{t.symbol}</td>
+                        <td className="px-2 py-1 text-center">
+                          <span
+                            className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                              t.action === "BUY"
+                                ? "bg-green-100 text-green-700"
+                                : "bg-red-100 text-red-700"
+                            }`}
+                          >
+                            {t.action}
+                          </span>
+                        </td>
+                        <td className="px-2 py-1 text-right">{t.quantity}</td>
+                        <td className="px-2 py-1 text-right">{formatNumber(t.price)}</td>
+                        <td className={`px-2 py-1 text-right ${percentColor(t.pnl || 0)}`}>
+                          {t.pnl != null ? formatNumber(t.pnl) : "-"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="p-6 text-center text-gray-400 text-sm">
+                No paper trades recorded yet
+              </div>
+            )}
           </div>
-        ) : (
-          <div className="bg-white rounded-lg border p-6 text-sm text-gray-500">
-            No paper trades yet. Bots will generate trades during NEPSE market hours.
-          </div>
-        )}
-      </div>
+        </>
+      )}
     </div>
   );
 }

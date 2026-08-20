@@ -1,227 +1,183 @@
-import { useState, useCallback } from "react";
-import { cn } from "../lib/utils";
+import { useState } from "react";
+import { apiGet } from "../api/client";
 
 interface TestResult {
   endpoint: string;
-  status: "success" | "error";
-  latencyMs: number;
-  responseSize: number;
+  status: "ok" | "error";
+  latency_ms: number;
+  response_size?: number;
   error?: string;
 }
 
-interface StressResult {
-  totalRequests: number;
-  successCount: number;
-  failCount: number;
-  avgLatencyMs: number;
-  p50Ms: number;
-  p95Ms: number;
-  p99Ms: number;
-  minMs: number;
-  maxMs: number;
-  requestsPerSecond: number;
-  totalTimeMs: number;
-}
-
-const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || "";
-const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || "";
-const BASE = `${SUPABASE_URL}/functions/v1/nepse-data`;
-
-const ENDPOINTS = [
-  { path: "/market/live", label: "Live Market (all stocks)" },
+const endpoints = [
+  { path: "/market/live", label: "Live Market" },
   { path: "/market/status", label: "Market Status" },
-  { path: "/indices", label: "Indices" },
   { path: "/market/top", label: "Top Stocks" },
-  { path: "/recommendations", label: "Recommendations" },
+  { path: "/indices", label: "Indices" },
   { path: "/health", label: "Health Check" },
-  { path: "/stocks/NABIL/prices?period=3m", label: "OHLCV (NABIL 3m)" },
+  { path: "/recommendations", label: "Recommendations" },
+  { path: "/stocks/NABIL/prices", label: "OHLCV (NABIL)" },
+  { path: "/market/sectors", label: "Sectors" },
 ];
-
-async function hitEndpoint(path: string): Promise<{ latencyMs: number; size: number; ok: boolean; error?: string }> {
-  const start = performance.now();
-  try {
-    const resp = await fetch(`${BASE}${path}`, {
-      headers: { Authorization: `Bearer ${SUPABASE_ANON_KEY}`, "Content-Type": "application/json" },
-    });
-    const body = await resp.text();
-    return { latencyMs: performance.now() - start, size: body.length, ok: resp.ok, error: resp.ok ? undefined : `HTTP ${resp.status}` };
-  } catch (err: unknown) {
-    return { latencyMs: performance.now() - start, size: 0, ok: false, error: err instanceof Error ? err.message : "Network error" };
-  }
-}
-
-function percentile(sorted: number[], pct: number): number {
-  if (sorted.length === 0) return 0;
-  const idx = Math.ceil((pct / 100) * sorted.length) - 1;
-  return sorted[Math.max(0, idx)];
-}
 
 export default function LoadTest() {
   const [results, setResults] = useState<TestResult[]>([]);
-  const [stress, setStress] = useState<StressResult | null>(null);
   const [running, setRunning] = useState(false);
-  const [concurrency, setConcurrency] = useState(10);
-  const [totalReqs, setTotalReqs] = useState(50);
+  const [concurrency, setConcurrency] = useState(1);
+  const [iterations, setIterations] = useState(3);
 
-  const runLatencyTest = useCallback(async () => {
+  const runTests = async () => {
     setRunning(true);
     setResults([]);
-    setStress(null);
+    const allResults: TestResult[] = [];
 
-    const newResults: TestResult[] = [];
-    for (const ep of ENDPOINTS) {
-      const r = await hitEndpoint(ep.path);
-      newResults.push({
-        endpoint: ep.label,
-        status: r.ok ? "success" : "error",
-        latencyMs: Math.round(r.latencyMs),
-        responseSize: r.size,
-        error: r.error,
+    for (let iter = 0; iter < iterations; iter++) {
+      const batch = endpoints.map(async (ep) => {
+        const start = performance.now();
+        try {
+          const resp = await apiGet(ep.path);
+          const latency = Math.round(performance.now() - start);
+          const size = JSON.stringify(resp).length;
+          return { endpoint: ep.label, status: "ok" as const, latency_ms: latency, response_size: size };
+        } catch (e: any) {
+          const latency = Math.round(performance.now() - start);
+          return { endpoint: ep.label, status: "error" as const, latency_ms: latency, error: e.message };
+        }
       });
-      setResults([...newResults]);
-    }
-    setRunning(false);
-  }, []);
 
-  const runStressTest = useCallback(async () => {
-    setRunning(true);
-    setStress(null);
-    setResults([]);
-
-    const latencies: number[] = [];
-    let successCount = 0;
-    let failCount = 0;
-    const startTime = performance.now();
-    let queueIdx = 0;
-
-    const worker = async () => {
-      while (queueIdx < totalReqs) {
-        const idx = queueIdx++;
-        const ep = ENDPOINTS[idx % ENDPOINTS.length];
-        const r = await hitEndpoint(ep.path);
-        latencies.push(r.latencyMs);
-        if (r.ok) successCount++;
-        else failCount++;
+      if (concurrency === 1) {
+        for (const p of batch) {
+          const r = await p;
+          allResults.push(r);
+          setResults([...allResults]);
+        }
+      } else {
+        const batchResults = await Promise.all(batch);
+        allResults.push(...batchResults);
+        setResults([...allResults]);
       }
-    };
+    }
 
-    await Promise.all(Array.from({ length: Math.min(concurrency, totalReqs) }, () => worker()));
-
-    const totalTime = performance.now() - startTime;
-    const sorted = [...latencies].sort((a, b) => a - b);
-
-    setStress({
-      totalRequests: totalReqs,
-      successCount,
-      failCount,
-      avgLatencyMs: Math.round(sorted.reduce((a, b) => a + b, 0) / (sorted.length || 1)),
-      p50Ms: Math.round(percentile(sorted, 50)),
-      p95Ms: Math.round(percentile(sorted, 95)),
-      p99Ms: Math.round(percentile(sorted, 99)),
-      minMs: Math.round(sorted[0] || 0),
-      maxMs: Math.round(sorted[sorted.length - 1] || 0),
-      requestsPerSecond: Math.round((totalReqs / totalTime) * 1000 * 100) / 100,
-      totalTimeMs: Math.round(totalTime),
-    });
     setRunning(false);
-  }, [concurrency, totalReqs]);
+  };
+
+  const grouped = results.reduce<Record<string, TestResult[]>>((acc, r) => {
+    (acc[r.endpoint] ||= []).push(r);
+    return acc;
+  }, {});
+
+  const stats = Object.entries(grouped).map(([name, runs]) => {
+    const latencies = runs.map((r) => r.latency_ms);
+    const ok = runs.filter((r) => r.status === "ok").length;
+    return {
+      name,
+      avg: Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length),
+      min: Math.min(...latencies),
+      max: Math.max(...latencies),
+      p95: latencies.sort((a, b) => a - b)[Math.floor(latencies.length * 0.95)] || 0,
+      success_rate: Math.round((ok / runs.length) * 100),
+      count: runs.length,
+    };
+  });
 
   return (
-    <div className="space-y-6">
-      <h2 className="text-xl font-bold text-gray-900">Stress Test & Latency Benchmark</h2>
-      <p className="text-sm text-gray-500">Tests the Supabase edge function scraping endpoints (live data from NEPSE sources).</p>
+    <div>
+      <h1 className="text-xl font-bold text-gray-900 mb-4">Stress / Load Test</h1>
 
-      <div className="bg-white rounded-lg border p-4 shadow-sm flex flex-wrap items-end gap-4">
-        <button onClick={runLatencyTest} disabled={running}
-          className="px-4 py-2 bg-teal-600 text-white text-sm font-medium rounded-md hover:bg-teal-700 disabled:opacity-50 transition-colors">
-          Run Latency Test
-        </button>
-        <div className="flex items-end gap-3">
+      <div className="bg-white rounded-lg border p-4 mb-6">
+        <div className="flex flex-wrap gap-4 items-end">
           <div>
-            <label className="block text-xs text-gray-500 mb-1">Concurrent</label>
-            <input type="number" min={1} max={100} value={concurrency}
+            <label className="text-xs text-gray-500 block mb-1">Iterations</label>
+            <input
+              type="number"
+              min={1}
+              max={20}
+              value={iterations}
+              onChange={(e) => setIterations(Number(e.target.value))}
+              className="border rounded px-2 py-1.5 text-sm w-20"
+            />
+          </div>
+          <div>
+            <label className="text-xs text-gray-500 block mb-1">Concurrency</label>
+            <select
+              value={concurrency}
               onChange={(e) => setConcurrency(Number(e.target.value))}
-              className="w-20 px-2 py-1.5 border rounded text-sm" />
+              className="border rounded px-2 py-1.5 text-sm"
+            >
+              <option value={1}>Sequential</option>
+              <option value={0}>Parallel</option>
+            </select>
           </div>
-          <div>
-            <label className="block text-xs text-gray-500 mb-1">Total Requests</label>
-            <input type="number" min={1} max={500} value={totalReqs}
-              onChange={(e) => setTotalReqs(Number(e.target.value))}
-              className="w-20 px-2 py-1.5 border rounded text-sm" />
-          </div>
-          <button onClick={runStressTest} disabled={running}
-            className="px-4 py-2 bg-orange-600 text-white text-sm font-medium rounded-md hover:bg-orange-700 disabled:opacity-50 transition-colors">
-            Run Stress Test
+          <button
+            onClick={runTests}
+            disabled={running}
+            className="bg-teal-600 text-white px-4 py-1.5 rounded-md text-sm font-medium hover:bg-teal-700 disabled:opacity-50"
+          >
+            {running ? "Running..." : "Run Test"}
           </button>
         </div>
-        {running && <span className="text-sm text-gray-500 animate-pulse">Running...</span>}
+        <p className="text-xs text-gray-400 mt-2">
+          Tests {endpoints.length} endpoints x {iterations} iterations ={" "}
+          {endpoints.length * iterations} requests
+        </p>
       </div>
 
-      {results.length > 0 && (
-        <div className="rounded-lg border bg-white shadow-sm overflow-hidden">
-          <div className="px-4 py-3 bg-gray-50 border-b">
-            <h3 className="text-sm font-semibold text-gray-700">Endpoint Latency (Edge Function → Scraper → Response)</h3>
+      {stats.length > 0 && (
+        <div className="bg-white rounded-lg border overflow-hidden">
+          <div className="p-3 border-b">
+            <h2 className="font-semibold text-sm text-gray-700">Results</h2>
           </div>
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-xs font-medium text-gray-500 uppercase border-b">
-                <th className="px-4 py-2">Endpoint</th>
-                <th className="px-4 py-2 text-right">Latency</th>
-                <th className="px-4 py-2 text-right">Size</th>
-                <th className="px-4 py-2">Status</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {results.map((r, i) => (
-                <tr key={i} className="hover:bg-gray-50">
-                  <td className="px-4 py-2 font-medium text-gray-800">{r.endpoint}</td>
-                  <td className="px-4 py-2 text-right font-mono">
-                    <span className={cn(r.latencyMs < 1000 ? "text-green-600" : r.latencyMs < 3000 ? "text-yellow-600" : "text-red-600")}>
-                      {r.latencyMs}ms
-                    </span>
-                  </td>
-                  <td className="px-4 py-2 text-right font-mono text-gray-500">
-                    {r.responseSize > 0 ? `${(r.responseSize / 1024).toFixed(1)}KB` : "-"}
-                  </td>
-                  <td className="px-4 py-2">
-                    {r.status === "success" ? (
-                      <span className="text-green-600 text-xs font-medium">OK</span>
-                    ) : (
-                      <span className="text-red-600 text-xs">{r.error}</span>
-                    )}
-                  </td>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-3 py-2 text-left">Endpoint</th>
+                  <th className="px-3 py-2 text-right">Avg (ms)</th>
+                  <th className="px-3 py-2 text-right">Min</th>
+                  <th className="px-3 py-2 text-right">Max</th>
+                  <th className="px-3 py-2 text-right">P95</th>
+                  <th className="px-3 py-2 text-right">Success</th>
+                  <th className="px-3 py-2 text-right">Calls</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="divide-y">
+                {stats.map((s) => (
+                  <tr key={s.name}>
+                    <td className="px-3 py-2 font-medium">{s.name}</td>
+                    <td className="px-3 py-2 text-right">
+                      <span
+                        className={
+                          s.avg < 500
+                            ? "text-green-600"
+                            : s.avg < 2000
+                              ? "text-amber-600"
+                              : "text-red-600"
+                        }
+                      >
+                        {s.avg}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2 text-right">{s.min}</td>
+                    <td className="px-3 py-2 text-right">{s.max}</td>
+                    <td className="px-3 py-2 text-right">{s.p95}</td>
+                    <td className="px-3 py-2 text-right">
+                      <span className={s.success_rate === 100 ? "text-green-600" : "text-red-600"}>
+                        {s.success_rate}%
+                      </span>
+                    </td>
+                    <td className="px-3 py-2 text-right">{s.count}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
 
-      {stress && (
-        <div className="rounded-lg border bg-white shadow-sm p-6">
-          <h3 className="text-sm font-semibold text-gray-700 mb-4">Stress Test Results</h3>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-            {[
-              { label: "Total Requests", value: stress.totalRequests },
-              { label: "Success", value: stress.successCount, color: "text-green-600" },
-              { label: "Failed", value: stress.failCount, color: "text-red-600" },
-              { label: "Req/sec", value: stress.requestsPerSecond },
-              { label: "Avg Latency", value: `${stress.avgLatencyMs}ms` },
-              { label: "P50", value: `${stress.p50Ms}ms` },
-              { label: "P95", value: `${stress.p95Ms}ms` },
-              { label: "P99", value: `${stress.p99Ms}ms` },
-              { label: "Min", value: `${stress.minMs}ms` },
-              { label: "Max", value: `${stress.maxMs}ms` },
-              { label: "Total Time", value: `${(stress.totalTimeMs / 1000).toFixed(1)}s` },
-              { label: "Error Rate", value: `${((stress.failCount / stress.totalRequests) * 100).toFixed(1)}%` },
-            ].map((stat) => (
-              <div key={stat.label} className="text-center">
-                <p className="text-xs text-gray-500">{stat.label}</p>
-                <p className={cn("text-lg font-bold font-mono", (stat as any).color || "text-gray-900")}>{stat.value}</p>
-              </div>
-            ))}
-          </div>
-        </div>
+      {running && results.length > 0 && (
+        <p className="text-xs text-gray-400 mt-3">
+          {results.length}/{endpoints.length * iterations} requests completed...
+        </p>
       )}
     </div>
   );
