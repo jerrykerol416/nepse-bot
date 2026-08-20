@@ -35,6 +35,3 @@ export async function apiGet<T = any>(path: string, params?: Record<string, stri
   console.log(`[NEPSE API] OK ${path}: ${elapsed}ms`, Array.isArray(data?.data) ? `${data.data.length} items` : data);
   return data;
 }
-
-
-export { apiGet }
