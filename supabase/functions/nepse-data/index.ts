@@ -456,58 +456,291 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    // /recommendations
+    // /recommendations - Multi-strategy proven technical analysis
     if (path === "/recommendations") {
       const stocks = await getLiveStocks();
-      const recs = stocks
-        .filter((s) => s.volume > 0 && s.ltp > 0)
-        .map((s) => {
-          const pct = s.percent_change;
-          let action: string;
-          let reason: string;
-          let confidence: number;
+      const sbUrl = Deno.env.get("SUPABASE_URL")!;
+      const sbKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+      const dbHeaders = { apikey: sbKey, Authorization: `Bearer ${sbKey}`, "Content-Type": "application/json" };
 
-          if (pct > 4) {
-            action = "BUY";
-            reason = `Strong momentum: +${pct.toFixed(1)}% with ${s.volume.toLocaleString()} volume`;
-            confidence = Math.min(85, 60 + pct * 3);
-          } else if (pct > 2) {
-            action = "BUY";
-            reason = `Positive trend: +${pct.toFixed(1)}% gain today`;
-            confidence = Math.min(70, 50 + pct * 5);
-          } else if (pct < -4) {
-            action = "SELL";
-            reason = `Sharp decline: ${pct.toFixed(1)}% - potential support breakdown`;
-            confidence = Math.min(80, 55 + Math.abs(pct) * 3);
-          } else if (pct < -2) {
-            action = "SELL";
-            reason = `Weakening: ${pct.toFixed(1)}% decline with selling pressure`;
-            confidence = Math.min(65, 45 + Math.abs(pct) * 4);
-          } else {
-            action = "HOLD";
-            reason = `Sideways movement: ${pct.toFixed(1)}%`;
-            confidence = 40;
+      // Fetch historical data for technical analysis (last 50 days)
+      const histRes = await fetch(
+        `${sbUrl}/rest/v1/stock_price_history?select=symbol,date,open,high,low,close,volume&order=date.desc&limit=5000`,
+        { headers: dbHeaders }
+      );
+      const history: { symbol: string; date: string; open: number; high: number; low: number; close: number; volume: number }[] = histRes.ok ? await histRes.json() : [];
+
+      // Group history by symbol
+      const histBySymbol: Record<string, typeof history> = {};
+      for (const h of history) {
+        if (!histBySymbol[h.symbol]) histBySymbol[h.symbol] = [];
+        histBySymbol[h.symbol].push(h);
+      }
+
+      // Also save today's prices for future analysis
+      const today = new Date().toISOString().slice(0, 10);
+      const todayPrices = stocks
+        .filter((s) => s.ltp > 0 && s.volume > 0)
+        .map((s) => ({
+          symbol: s.symbol,
+          date: today,
+          open: s.open || s.ltp,
+          high: s.high || s.ltp,
+          low: s.low || s.ltp,
+          close: s.ltp,
+          volume: s.volume,
+          percent_change: s.percent_change,
+        }));
+
+      if (todayPrices.length > 0) {
+        fetch(`${sbUrl}/rest/v1/stock_price_history`, {
+          method: "POST",
+          headers: { ...dbHeaders, Prefer: "resolution=merge-duplicates" },
+          body: JSON.stringify(todayPrices),
+        }).catch(() => {});
+      }
+
+      const recs: {
+        symbol: string;
+        action: string;
+        confidence: number;
+        reason: string;
+        strategy: string;
+        current_price: number;
+        target_price: number;
+        stoploss: number;
+        risk_reward: string;
+      }[] = [];
+
+      for (const stock of stocks.filter((s) => s.volume > 0 && s.ltp > 0)) {
+        const hist = histBySymbol[stock.symbol] || [];
+        const closes = hist.map((h) => h.close).reverse();
+        const volumes = hist.map((h) => h.volume).reverse();
+        const highs = hist.map((h) => h.high).reverse();
+        const lows = hist.map((h) => h.low).reverse();
+
+        // Add today's data
+        closes.push(stock.ltp);
+        volumes.push(stock.volume);
+        highs.push(stock.high || stock.ltp);
+        lows.push(stock.low || stock.ltp);
+
+        const signals: { action: string; confidence: number; reason: string; strategy: string; target: number; stoploss: number }[] = [];
+
+        // === STRATEGY 1: RSI (Relative Strength Index) ===
+        if (closes.length >= 15) {
+          const rsi = calcRSI(closes, 14);
+          if (rsi < 30) {
+            signals.push({
+              action: "BUY",
+              confidence: Math.min(85, 60 + (30 - rsi) * 1.5),
+              reason: `RSI oversold at ${rsi.toFixed(0)} - historically rebounds from this level`,
+              strategy: "RSI Oversold",
+              target: Math.round(stock.ltp * 1.08),
+              stoploss: Math.round(stock.ltp * 0.95),
+            });
+          } else if (rsi > 70) {
+            signals.push({
+              action: "SELL",
+              confidence: Math.min(85, 55 + (rsi - 70) * 1.5),
+              reason: `RSI overbought at ${rsi.toFixed(0)} - price likely to correct`,
+              strategy: "RSI Overbought",
+              target: Math.round(stock.ltp * 0.94),
+              stoploss: Math.round(stock.ltp * 1.04),
+            });
           }
+        }
 
-          return {
-            symbol: s.symbol,
-            action,
-            confidence: Math.round(confidence),
-            reason,
-            current_price: s.ltp,
-            target_price:
-              action === "BUY"
-                ? Math.round(s.ltp * 1.08)
-                : action === "SELL"
-                  ? Math.round(s.ltp * 0.95)
-                  : s.ltp,
-          };
-        })
-        .filter((r) => r.action !== "HOLD")
-        .sort((a, b) => b.confidence - a.confidence)
-        .slice(0, 20);
+        // === STRATEGY 2: EMA Crossover (9/21) ===
+        if (closes.length >= 22) {
+          const ema9 = calcEMA(closes, 9);
+          const ema21 = calcEMA(closes, 21);
+          const prevEma9 = calcEMA(closes.slice(0, -1), 9);
+          const prevEma21 = calcEMA(closes.slice(0, -1), 21);
 
-      return json({ data: recs });
+          if (prevEma9 <= prevEma21 && ema9 > ema21) {
+            signals.push({
+              action: "BUY",
+              confidence: 72,
+              reason: `EMA 9 crossed above EMA 21 - bullish momentum shift confirmed`,
+              strategy: "EMA Crossover",
+              target: Math.round(stock.ltp * 1.10),
+              stoploss: Math.round(stock.ltp * 0.96),
+            });
+          } else if (prevEma9 >= prevEma21 && ema9 < ema21) {
+            signals.push({
+              action: "SELL",
+              confidence: 70,
+              reason: `EMA 9 crossed below EMA 21 - bearish momentum shift`,
+              strategy: "EMA Crossover",
+              target: Math.round(stock.ltp * 0.92),
+              stoploss: Math.round(stock.ltp * 1.04),
+            });
+          }
+        }
+
+        // === STRATEGY 3: Bollinger Band Mean Reversion ===
+        if (closes.length >= 20) {
+          const sma20 = closes.slice(-20).reduce((a, b) => a + b, 0) / 20;
+          const stdDev = Math.sqrt(closes.slice(-20).reduce((sum, c) => sum + Math.pow(c - sma20, 2), 0) / 20);
+          const upperBand = sma20 + 2 * stdDev;
+          const lowerBand = sma20 - 2 * stdDev;
+          const currentPrice = stock.ltp;
+
+          if (currentPrice <= lowerBand) {
+            signals.push({
+              action: "BUY",
+              confidence: Math.min(80, 65 + ((lowerBand - currentPrice) / lowerBand) * 100),
+              reason: `Price at lower Bollinger Band (${lowerBand.toFixed(0)}) - mean reversion expected to ${sma20.toFixed(0)}`,
+              strategy: "Bollinger Band",
+              target: Math.round(sma20),
+              stoploss: Math.round(lowerBand * 0.97),
+            });
+          } else if (currentPrice >= upperBand) {
+            signals.push({
+              action: "SELL",
+              confidence: Math.min(75, 60 + ((currentPrice - upperBand) / upperBand) * 100),
+              reason: `Price at upper Bollinger Band (${upperBand.toFixed(0)}) - likely to revert to mean ${sma20.toFixed(0)}`,
+              strategy: "Bollinger Band",
+              target: Math.round(sma20),
+              stoploss: Math.round(upperBand * 1.03),
+            });
+          }
+        }
+
+        // === STRATEGY 4: Volume Breakout ===
+        if (volumes.length >= 10) {
+          const avgVol = volumes.slice(-10).reduce((a, b) => a + b, 0) / 10;
+          const volRatio = stock.volume / Math.max(avgVol, 1);
+
+          if (volRatio > 2.5 && stock.percent_change > 3) {
+            signals.push({
+              action: "BUY",
+              confidence: Math.min(82, 60 + volRatio * 5),
+              reason: `Volume breakout: ${volRatio.toFixed(1)}x average volume with +${stock.percent_change.toFixed(1)}% move - institutional buying`,
+              strategy: "Volume Breakout",
+              target: Math.round(stock.ltp * 1.12),
+              stoploss: Math.round(stock.ltp * 0.95),
+            });
+          } else if (volRatio > 2.5 && stock.percent_change < -3) {
+            signals.push({
+              action: "SELL",
+              confidence: Math.min(78, 55 + volRatio * 5),
+              reason: `High volume selloff: ${volRatio.toFixed(1)}x average with ${stock.percent_change.toFixed(1)}% decline - distribution phase`,
+              strategy: "Volume Breakout",
+              target: Math.round(stock.ltp * 0.90),
+              stoploss: Math.round(stock.ltp * 1.04),
+            });
+          }
+        }
+
+        // === STRATEGY 5: MACD ===
+        if (closes.length >= 27) {
+          const ema12 = calcEMA(closes, 12);
+          const ema26 = calcEMA(closes, 26);
+          const macd = ema12 - ema26;
+          const prevEma12 = calcEMA(closes.slice(0, -1), 12);
+          const prevEma26 = calcEMA(closes.slice(0, -1), 26);
+          const prevMacd = prevEma12 - prevEma26;
+
+          // Signal line approximation (9-period EMA of MACD)
+          if (prevMacd < 0 && macd > 0) {
+            signals.push({
+              action: "BUY",
+              confidence: 70,
+              reason: `MACD crossed above zero line - momentum turning bullish`,
+              strategy: "MACD",
+              target: Math.round(stock.ltp * 1.08),
+              stoploss: Math.round(stock.ltp * 0.96),
+            });
+          } else if (prevMacd > 0 && macd < 0) {
+            signals.push({
+              action: "SELL",
+              confidence: 68,
+              reason: `MACD crossed below zero - momentum turning bearish`,
+              strategy: "MACD",
+              target: Math.round(stock.ltp * 0.93),
+              stoploss: Math.round(stock.ltp * 1.04),
+            });
+          }
+        }
+
+        // === STRATEGY 6: Support/Resistance Breakout ===
+        if (highs.length >= 20 && lows.length >= 20) {
+          const recent20High = Math.max(...highs.slice(-20));
+          const recent20Low = Math.min(...lows.slice(-20));
+
+          if (stock.ltp > recent20High * 0.99 && stock.percent_change > 1) {
+            signals.push({
+              action: "BUY",
+              confidence: 75,
+              reason: `Breaking 20-day high (${recent20High.toFixed(0)}) with momentum - resistance breakout`,
+              strategy: "Breakout",
+              target: Math.round(stock.ltp * 1.10),
+              stoploss: Math.round(recent20High * 0.97),
+            });
+          } else if (stock.ltp < recent20Low * 1.01 && stock.percent_change < -1) {
+            signals.push({
+              action: "SELL",
+              confidence: 72,
+              reason: `Breaking 20-day low (${recent20Low.toFixed(0)}) - support breakdown`,
+              strategy: "Breakout",
+              target: Math.round(stock.ltp * 0.90),
+              stoploss: Math.round(recent20Low * 1.03),
+            });
+          }
+        }
+
+        // === STRATEGY 7: Momentum (Rate of Change) ===
+        if (closes.length >= 10) {
+          const roc = ((stock.ltp - closes[closes.length - 10]) / closes[closes.length - 10]) * 100;
+          if (roc > 15 && stock.percent_change > 2) {
+            signals.push({
+              action: "BUY",
+              confidence: Math.min(78, 55 + roc * 0.8),
+              reason: `Strong 10-day momentum: +${roc.toFixed(1)}% ROC with continued buying`,
+              strategy: "Momentum",
+              target: Math.round(stock.ltp * 1.08),
+              stoploss: Math.round(stock.ltp * 0.94),
+            });
+          } else if (roc < -12) {
+            signals.push({
+              action: "BUY",
+              confidence: Math.min(70, 50 + Math.abs(roc) * 0.5),
+              reason: `Oversold on momentum: ${roc.toFixed(1)}% ROC in 10 days - potential reversal`,
+              strategy: "Momentum Reversal",
+              target: Math.round(stock.ltp * 1.06),
+              stoploss: Math.round(stock.ltp * 0.94),
+            });
+          }
+        }
+
+        // Pick the strongest signal for this stock
+        if (signals.length > 0) {
+          const best = signals.sort((a, b) => b.confidence - a.confidence)[0];
+          const target = best.target;
+          const sl = best.stoploss;
+          const reward = Math.abs(target - stock.ltp);
+          const risk = Math.abs(stock.ltp - sl);
+          const rr = risk > 0 ? (reward / risk).toFixed(1) : "N/A";
+
+          recs.push({
+            symbol: stock.symbol,
+            action: best.action,
+            confidence: Math.round(best.confidence),
+            reason: best.reason,
+            strategy: best.strategy,
+            current_price: stock.ltp,
+            target_price: target,
+            stoploss: sl,
+            risk_reward: `1:${rr}`,
+          });
+        }
+      }
+
+      // Sort by confidence, show top 30
+      recs.sort((a, b) => b.confidence - a.confidence);
+      return json({ data: recs.slice(0, 30) });
     }
 
     // /bot/status
@@ -595,3 +828,30 @@ function json(data: unknown): Response {
     headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
 }
+
+function calcEMA(prices: number[], period: number): number {
+  if (prices.length < period) return prices[prices.length - 1] || 0;
+  const k = 2 / (period + 1);
+  let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < prices.length; i++) {
+    ema = prices[i] * k + ema * (1 - k);
+  }
+  return ema;
+}
+
+function calcRSI(prices: number[], period: number): number {
+  if (prices.length < period + 1) return 50;
+  let gains = 0;
+  let losses = 0;
+  for (let i = prices.length - period; i < prices.length; i++) {
+    const diff = prices[i] - prices[i - 1];
+    if (diff > 0) gains += diff;
+    else losses += Math.abs(diff);
+  }
+  const avgGain = gains / period;
+  const avgLoss = losses / period;
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - 100 / (1 + rs);
+}
+
