@@ -5,6 +5,7 @@ import path from "path";
 export default defineConfig({
   plugins: [react()],
   root: "nepse-bot-fe",
+  envDir: path.resolve(__dirname),
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./nepse-bot-fe/src"),
