@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "sentry": {
+      "enabled": true
+    },
+    "linear": {
+      "enabled": true
+    },
+    "notion": {
+      "enabled": true
+    }
+  }
+}
