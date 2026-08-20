@@ -512,64 +512,69 @@ Deno.serve(async (req: Request) => {
 
     // /bot/status
     if (path === "/bot/status") {
-      return json({
-        scheduler: "active",
-        bots: [
-          {
-            name: "EMA Crossover Bot",
-            status: "running",
-            strategy: "EMA 9/21 crossover",
-            last_run: new Date().toISOString(),
-            trades_today: 0,
-            pnl: 0,
+      const sbUrl = Deno.env.get("SUPABASE_URL")!;
+      const sbKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+      const headers = { apikey: sbKey, Authorization: `Bearer ${sbKey}`, "Content-Type": "application/json" };
+
+      const [botsRes, tradesRes, learningRes, runsRes] = await Promise.all([
+        fetch(`${sbUrl}/rest/v1/bot_configs?select=*&order=created_at.asc`, { headers }),
+        fetch(`${sbUrl}/rest/v1/paper_trades?select=*&order=created_at.desc&limit=100`, { headers }),
+        fetch(`${sbUrl}/rest/v1/bot_learning_log?select=*&order=created_at.desc&limit=50`, { headers }),
+        fetch(`${sbUrl}/rest/v1/bot_run_log?select=*&order=ran_at.desc&limit=20`, { headers }),
+      ]);
+
+      const bots = botsRes.ok ? await botsRes.json() : [];
+      const trades = tradesRes.ok ? await tradesRes.json() : [];
+      const learning = learningRes.ok ? await learningRes.json() : [];
+      const runs = runsRes.ok ? await runsRes.json() : [];
+
+      const botStatus = bots.map((bot: Record<string, unknown>) => {
+        const botTrades = trades.filter((t: Record<string, unknown>) => t.bot_id === bot.id);
+        const closedTrades = botTrades.filter((t: Record<string, unknown>) => t.status === "closed");
+        const openTrades = botTrades.filter((t: Record<string, unknown>) => t.status === "open");
+        const totalPnl = closedTrades.reduce((sum: number, t: Record<string, unknown>) => sum + ((t.pnl as number) || 0), 0);
+        const wins = closedTrades.filter((t: Record<string, unknown>) => (t.pnl as number) > 0).length;
+        const losses = closedTrades.filter((t: Record<string, unknown>) => (t.pnl as number) <= 0).length;
+        const botLearning = learning.filter((l: Record<string, unknown>) => l.bot_id === bot.id);
+        const lastRun = runs.find((r: Record<string, unknown>) => r.bot_id === bot.id);
+
+        return {
+          id: bot.id,
+          name: bot.name,
+          strategy: bot.strategy,
+          status: bot.is_active ? "running" : "paused",
+          budget: bot.budget,
+          risk_per_trade: bot.risk_per_trade,
+          max_positions: bot.max_positions,
+          parameters: bot.parameters,
+          last_run: lastRun ? lastRun.ran_at : null,
+          stats: {
+            total_trades: closedTrades.length,
+            open_positions: openTrades.length,
+            wins,
+            losses,
+            win_rate: closedTrades.length > 0 ? Math.round((wins / closedTrades.length) * 100) : 0,
+            total_pnl: totalPnl,
+            budget_used: openTrades.reduce((sum: number, t: Record<string, unknown>) => sum + ((t.entry_price as number) * (t.quantity as number) || 0), 0),
           },
-          {
-            name: "Momentum Bot",
-            status: "running",
-            strategy: "RSI + Volume breakout",
-            last_run: new Date().toISOString(),
-            trades_today: 0,
-            pnl: 0,
-          },
-          {
-            name: "Volume Breakout Bot",
-            status: "running",
-            strategy: "Volume surge detection",
-            last_run: new Date().toISOString(),
-            trades_today: 0,
-            pnl: 0,
-          },
-          {
-            name: "Mean Reversion Bot",
-            status: "running",
-            strategy: "Bollinger Band bounce",
-            last_run: new Date().toISOString(),
-            trades_today: 0,
-            pnl: 0,
-          },
-          {
-            name: "SMC Bot",
-            status: "running",
-            strategy: "Smart Money Concepts",
-            last_run: new Date().toISOString(),
-            trades_today: 0,
-            pnl: 0,
-          },
-          {
-            name: "Sector Rotation Bot",
-            status: "running",
-            strategy: "Sector momentum",
-            last_run: new Date().toISOString(),
-            trades_today: 0,
-            pnl: 0,
-          },
-        ],
+          recent_learning: botLearning.slice(0, 3),
+          open_trades: openTrades.slice(0, 5),
+        };
       });
+
+      return json({ scheduler: "active", bots: botStatus });
     }
 
     // /bot/paper-trades
     if (path === "/bot/paper-trades") {
-      return json({ data: [] });
+      const sbUrl = Deno.env.get("SUPABASE_URL")!;
+      const sbKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+      const headers = { apikey: sbKey, Authorization: `Bearer ${sbKey}`, "Content-Type": "application/json" };
+
+      const res = await fetch(`${sbUrl}/rest/v1/paper_trades?select=*,bot_configs(name)&order=created_at.desc&limit=50`, { headers });
+      const trades = res.ok ? await res.json() : [];
+
+      return json({ data: trades });
     }
 
     return new Response(
