@@ -20,5 +20,5 @@
       "@/*": ["./nepse-bot-fe/src/*"]
     }
   },
-  "include": ["nepse-bot-fe/src"]
+  "include": ["nepse-bot-fe/src", "nepse-bot-fe/src/vite-env.d.ts"]
 }

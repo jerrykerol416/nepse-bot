@@ -1,4 +1,4 @@
-import api from "./client";
+import request from "./client";
 
 export interface Stock {
   symbol: string;
@@ -11,6 +11,7 @@ export interface Stock {
   volume: number;
   turnover: number;
   prev_close: number;
+  source?: string;
 }
 
 export interface HealthSource {
@@ -21,46 +22,43 @@ export interface HealthSource {
 }
 
 export async function fetchLiveMarket(): Promise<Stock[]> {
-  const { data } = await api.get("/free/market/live");
-  return data.data || data || [];
+  const data = await request<{ data: Stock[] }>("/market/live");
+  return data.data || [];
 }
 
 export async function fetchHealth(): Promise<HealthSource[]> {
-  const { data } = await api.get("/free/health");
-  return data.sources || data || [];
+  const data = await request<{ sources: HealthSource[] }>("/health");
+  return data.sources || [];
 }
 
-export async function fetchMarketStatus(): Promise<any> {
-  const { data } = await api.get("/free/market/status");
-  return data;
+export async function fetchMarketStatus(): Promise<{ is_open: boolean; nepal_time: string }> {
+  return request("/market/status");
 }
 
 export async function fetchIndices(): Promise<any[]> {
-  const { data } = await api.get("/free/indices");
-  return data.data || data || [];
+  const data = await request<{ data: any[] }>("/indices");
+  return data.data || [];
 }
 
-export async function fetchTopStocks(): Promise<any> {
-  const { data } = await api.get("/free/market/top");
-  return data;
+export async function fetchTopStocks(): Promise<{ gainers: Stock[]; losers: Stock[]; turnover: Stock[] }> {
+  return request("/market/top");
 }
 
 export async function fetchRecommendations(): Promise<any[]> {
-  const { data } = await api.get("/free/recommendations");
-  return data.data || data || [];
+  const data = await request<{ data: any[] }>("/recommendations");
+  return data.data || [];
 }
 
 export async function fetchOhlcv(symbol: string, period = "1y"): Promise<any[]> {
-  const { data } = await api.get(`/free/stocks/${symbol}/prices`, { params: { period } });
-  return data.data || data || [];
+  const data = await request<{ data: any[] }>(`/stocks/${symbol}/prices`, { period });
+  return data.data || [];
 }
 
 export async function fetchBotStatus(): Promise<any> {
-  const { data } = await api.get("/bot/status");
-  return data;
+  return request("/bot/status");
 }
 
 export async function fetchBotTrades(): Promise<any[]> {
-  const { data } = await api.get("/bot/paper-trades");
-  return data.data || data || [];
+  const data = await request<{ data: any[] }>("/bot/paper-trades");
+  return data.data || [];
 }
