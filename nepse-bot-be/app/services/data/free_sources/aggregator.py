@@ -25,7 +25,7 @@ import math
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from . import yonepse, samirwagle, merolagani, nepsealpha, sharesansar, nepalipaisa, nepsetrading
+from . import yonepse, samirwagle, merolagani, nepsealpha, sharesansar, nepalipaisa, nepsetrading, sharehub
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,7 @@ async def live_market() -> List[Dict[str, Any]]:
     return await _first_nonempty_list(
         merolagani.get_live_market(),
         sharesansar.get_live_market(),
+        sharehub.get_live_market(),
         nepalipaisa.get_live_market(),
         nepsetrading.get_live_market(),
         nepsealpha.get_live_market(),

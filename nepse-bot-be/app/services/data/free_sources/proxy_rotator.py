@@ -245,20 +245,31 @@ class ProxyRotator:
         self._rl_until: Dict[str, float] = {}      # proxy → epoch (rate-limit ban)
         self._lock = threading.Lock()
 
-        # ── Remote proxy-list URL ──────────────────────────────────────────
-        self._proxy_list_url: Optional[str] = os.environ.get(
-            "PROXY_LIST_URL", ""
-        ).strip() or None
+        # ── Remote proxy-list URL(s) ──────────────────────────────────────
+        custom_url = os.environ.get("PROXY_LIST_URL", "").strip()
 
-        refresh_raw = os.environ.get("PROXY_LIST_REFRESH_INTERVAL", "3600").strip()
+        # Multiple free proxy sources for redundancy
+        _DEFAULT_PROXY_URLS: List[str] = [
+            "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=5000&country=&ssl=all&anonymity=all",
+            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+            "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+        ]
+
+        self._proxy_list_urls: List[str] = (
+            [custom_url] if custom_url else _DEFAULT_PROXY_URLS
+        )
+
+        refresh_raw = os.environ.get("PROXY_LIST_REFRESH_INTERVAL", "1800").strip()
         try:
             self._refresh_interval: float = max(0.0, float(refresh_raw))
         except ValueError:
-            self._refresh_interval = 3600.0
+            self._refresh_interval = 1800.0
 
         url_proxies: List[str] = []
-        if self._proxy_list_url:
-            url_proxies = fetch_proxies_from_url(self._proxy_list_url)
+        for url in self._proxy_list_urls:
+            fetched = fetch_proxies_from_url(url)
+            url_proxies.extend(fetched)
 
         # Merge: static list first (higher priority / authenticated proxies),
         # then remote list; deduplicate while preserving order.
@@ -272,7 +283,7 @@ class ProxyRotator:
 
         if self._proxies:
             logger.info(
-                "ProxyRotator: %d proxies loaded (%d static, %d from URL)",
+                "ProxyRotator: %d proxies loaded (%d static, %d from URLs)",
                 len(self._proxies),
                 len(static_proxies),
                 len(url_proxies),
@@ -281,7 +292,7 @@ class ProxyRotator:
             logger.debug("ProxyRotator: no proxies configured — going direct")
 
         # ── Background refresh thread ──────────────────────────────────────
-        if self._proxy_list_url and self._refresh_interval > 0:
+        if self._proxy_list_urls and self._refresh_interval > 0:
             t = threading.Thread(
                 target=self._refresh_loop,
                 name="proxy-rotator-refresh",
@@ -289,22 +300,24 @@ class ProxyRotator:
             )
             t.start()
             logger.debug(
-                "ProxyRotator: refresh thread started (interval=%.0fs, url=%s)",
+                "ProxyRotator: refresh thread started (interval=%.0fs, %d URL sources)",
                 self._refresh_interval,
-                self._proxy_list_url,
+                len(self._proxy_list_urls),
             )
 
     # ── background refresh ────────────────────────────────────────────────────
 
     def _refresh_loop(self) -> None:
-        """Background thread: re-fetches PROXY_LIST_URL every refresh_interval s."""
+        """Background thread: re-fetches proxy lists every refresh_interval s."""
         while True:
             time.sleep(self._refresh_interval)
             try:
-                new_proxies = fetch_proxies_from_url(self._proxy_list_url)  # type: ignore[arg-type]
+                new_proxies: List[str] = []
+                for url in self._proxy_list_urls:
+                    fetched = fetch_proxies_from_url(url)
+                    new_proxies.extend(fetched)
                 if new_proxies:
                     with self._lock:
-                        # Keep static proxies at front; replace the URL-sourced tail
                         static_raw = os.environ.get("PROXY_LIST", "").strip()
                         static: List[str] = (
                             [p.strip() for p in static_raw.split(",") if p.strip()]
@@ -318,7 +331,6 @@ class ProxyRotator:
                                 seen.add(p)
                                 merged.append(p)
                         self._proxies = merged
-                        # Purge ban state for proxies no longer in pool
                         current = set(merged)
                         for d in (self._failures, self._banned_until, self._rl_until):
                             for k in list(d.keys()):

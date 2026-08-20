@@ -47,13 +47,13 @@ cheap and stay within free-tier request budgets.
 from .cache import TTLCache, get_cache
 from .proxy_rotator import ProxyRotator, get_rotator, get_nepal_rotator
 from . import yonepse, samirwagle, merolagani, nepsealpha, sharesansar
-from . import nepalipaisa, nepsetrading, aggregator
+from . import nepalipaisa, nepsetrading, sharehub, aggregator
 
 __all__ = [
     "TTLCache", "get_cache",
     "ProxyRotator", "get_rotator", "get_nepal_rotator",
     "yonepse", "samirwagle",
     "merolagani", "nepsealpha", "sharesansar",
-    "nepalipaisa", "nepsetrading",
+    "nepalipaisa", "nepsetrading", "sharehub",
     "aggregator",
 ]
