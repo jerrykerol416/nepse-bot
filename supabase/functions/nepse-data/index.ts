@@ -3,16 +3,16 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
+  "Access-Control-Allow-Headers":
+    "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
-// Rotating user agents to avoid detection
 const USER_AGENTS = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
 ];
 
 function randomUA(): string {
@@ -23,10 +23,9 @@ function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// In-memory cache (survives within a single warm instance)
 const cache: Map<string, { data: unknown; expiry: number }> = new Map();
 
-function getCached(key: string, ttlMs: number): unknown | null {
+function getCached(key: string): unknown | null {
   const entry = cache.get(key);
   if (entry && Date.now() < entry.expiry) return entry.data;
   return null;
@@ -36,51 +35,90 @@ function setCache(key: string, data: unknown, ttlMs: number) {
   cache.set(key, { data, expiry: Date.now() + ttlMs });
 }
 
-// ─── Scraper: MeroLagani (globally accessible, real-time) ────────────────────
+interface Stock {
+  symbol: string;
+  ltp: number;
+  change: number;
+  percent_change: number;
+  high: number;
+  low: number;
+  open: number;
+  volume: number;
+  turnover: number;
+  prev_close: number;
+  source: string;
+}
 
-async function scrapeMerolagani(): Promise<unknown[]> {
-  const cached = getCached("merolagani:live", 45_000);
-  if (cached) return cached as unknown[];
+// ─── Scraper: MeroLagani ─────────────────────────────────────────────────────
+// Columns: Symbol(link) | LTP | %Change | Open | High | Low | Qty | (buttons)
+
+async function scrapeMerolagani(): Promise<Stock[]> {
+  const cached = getCached("merolagani:live");
+  if (cached) return cached as Stock[];
 
   try {
-    await delay(Math.random() * 300);
+    await delay(Math.random() * 200);
     const resp = await fetch("https://merolagani.com/LatestMarket.aspx", {
-      headers: { "User-Agent": randomUA(), "Accept": "text/html", "Accept-Language": "en-US,en;q=0.9" },
+      headers: {
+        "User-Agent": randomUA(),
+        Accept: "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
     });
     if (!resp.ok) return [];
     const html = await resp.text();
 
-    // Parse the HTML table - extract stock rows
-    const stocks: unknown[] = [];
-    const tableMatch = html.match(/<table[^>]*id="[^"]*live[^"]*"[^>]*>([\s\S]*?)<\/table>/i)
-      || html.match(/<table[^>]*class="[^"]*table[^"]*"[^>]*>([\s\S]*?)<\/table>/i);
-
+    const stocks: Stock[] = [];
+    // Match the live-trading table
+    const tableMatch = html.match(
+      /<table[^>]*class=['"][^'"]*live-trading[^'"]*['"][^>]*>([\s\S]*?)<\/table>/i
+    );
     if (!tableMatch) return [];
 
     const rows = tableMatch[1].match(/<tr[^>]*>([\s\S]*?)<\/tr>/gi) || [];
-    for (const row of rows.slice(1)) { // skip header
+    for (const row of rows) {
       const cols = (row.match(/<td[^>]*>([\s\S]*?)<\/td>/gi) || []).map(
         (td: string) => td.replace(/<[^>]*>/g, "").trim()
       );
-      if (cols.length < 6) continue;
-      const symbol = cols[0]?.replace(/\s+/g, "").toUpperCase();
+      if (cols.length < 7) continue;
+
+      // Extract symbol from the first <a> tag in first td
+      const symbolMatch = row.match(
+        /href='[^']*symbol=([^'&]+)'/i
+      ) || row.match(/href="[^"]*symbol=([^"&]+)"/i);
+      const symbol = symbolMatch
+        ? symbolMatch[1].toUpperCase()
+        : cols[0].replace(/\s+/g, "").toUpperCase();
+
       const ltp = parseFloat(cols[1]?.replace(/,/g, "") || "0");
-      if (!symbol || !ltp || symbol.length > 20) continue;
+      if (!symbol || !ltp || symbol.length > 20 || symbol.length < 2) continue;
+
+      const pctChange = parseFloat(cols[2]?.replace(/,/g, "") || "0");
+      const c3 = parseFloat(cols[3]?.replace(/,/g, "") || "0") || ltp;
+      const c4 = parseFloat(cols[4]?.replace(/,/g, "") || "0") || ltp;
+      const c5 = parseFloat(cols[5]?.replace(/,/g, "") || "0") || ltp;
+      const high = Math.max(c3, c4, c5, ltp);
+      const low = Math.min(c3, c4, c5, ltp);
+      const openPrice = c3;
+      const volume = parseInt(cols[6]?.replace(/,/g, "") || "0", 10) || 0;
+      const prevClose = pctChange !== 0 ? ltp / (1 + pctChange / 100) : ltp;
+      const change = ltp - prevClose;
 
       stocks.push({
         symbol,
         ltp,
-        change: parseFloat(cols[2]?.replace(/,/g, "") || "0"),
-        percent_change: parseFloat(cols[3]?.replace(/,/g, "") || "0"),
-        high: parseFloat(cols[4]?.replace(/,/g, "") || "0") || ltp,
-        low: parseFloat(cols[5]?.replace(/,/g, "") || "0") || ltp,
-        open: ltp - parseFloat(cols[2]?.replace(/,/g, "") || "0"),
-        volume: parseInt(cols[6]?.replace(/,/g, "") || "0", 10) || 0,
-        turnover: parseFloat(cols[7]?.replace(/,/g, "") || "0"),
-        prev_close: ltp - parseFloat(cols[2]?.replace(/,/g, "") || "0"),
+        change: Math.round(change * 100) / 100,
+        percent_change: pctChange,
+        high,
+        low,
+        open: openPrice,
+        volume,
+        turnover: ltp * volume,
+        prev_close: Math.round(prevClose * 100) / 100,
         source: "merolagani",
       });
     }
+
     if (stocks.length > 0) setCache("merolagani:live", stocks, 45_000);
     return stocks;
   } catch (e) {
@@ -89,82 +127,126 @@ async function scrapeMerolagani(): Promise<unknown[]> {
   }
 }
 
-// ─── Scraper: Yonepse GitHub JSON (always reachable, ~15min lag) ─────────────
+// ─── Scraper: ShareSansar ────────────────────────────────────────────────────
+// Columns: SN | Symbol(link) | Conf | Open | High | Low | Close/LTP | Close | ... | Vol | PClose | Turnover | ... | Diff | ...
 
-async function scrapeYonepse(): Promise<unknown[]> {
-  const cached = getCached("yonepse:live", 60_000);
-  if (cached) return cached as unknown[];
+async function scrapeSharesansar(): Promise<Stock[]> {
+  const cached = getCached("sharesansar:live");
+  if (cached) return cached as Stock[];
 
   try {
-    const resp = await fetch(
-      "https://raw.githubusercontent.com/AashishBhandari535/nepse-json/refs/heads/main/live-market.json",
-      { headers: { "User-Agent": randomUA() } }
-    );
+    await delay(Math.random() * 300);
+    const resp = await fetch("https://www.sharesansar.com/today-share-price", {
+      headers: {
+        "User-Agent": randomUA(),
+        Accept: "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    });
     if (!resp.ok) return [];
-    const json = await resp.json();
-    const items = Array.isArray(json) ? json : json?.data || [];
+    const html = await resp.text();
 
-    const stocks = items.map((item: Record<string, unknown>) => ({
-      symbol: (item.symbol as string || "").toUpperCase(),
-      ltp: Number(item.lastTradedPrice || item.ltp || item.closingPrice || 0),
-      change: Number(item.pointChange || item.change || 0),
-      percent_change: Number(item.percentageChange || item.percent_change || 0),
-      high: Number(item.highPrice || item.high || 0),
-      low: Number(item.lowPrice || item.low || 0),
-      open: Number(item.openPrice || item.open || 0),
-      volume: Number(item.totalTradeQuantity || item.volume || 0),
-      turnover: Number(item.totalTurnover || item.turnover || 0),
-      prev_close: Number(item.previousClosing || item.previousClose || item.prev_close || 0),
-      source: "yonepse",
-    })).filter((s: { symbol: string; ltp: number }) => s.symbol && s.ltp > 0);
+    const stocks: Stock[] = [];
+    const tbodyMatch = html.match(/<tbody>([\s\S]*?)<\/tbody>/i);
+    if (!tbodyMatch) return [];
 
-    if (stocks.length > 0) setCache("yonepse:live", stocks, 60_000);
+    const rows = tbodyMatch[1].match(/<tr[^>]*>([\s\S]*?)<\/tr>/gi) || [];
+    for (const row of rows) {
+      const cols = (row.match(/<td[^>]*>([\s\S]*?)<\/td>/gi) || []).map(
+        (td: string) => td.replace(/<[^>]*>/g, "").trim()
+      );
+      // sharesansar: 24 columns
+      // 0=SN, 1=Symbol, 2=Conf, 3=Open, 4=High, 5=Low, 6=LTP, 7=Close,
+      // 8=?, 9=?, 10=VWAP, 11=Vol, 12=PClose, 13=Turnover, 14=Transactions
+      // 15=Diff, 16=Range, 17=DiffPct, 18=RangePct, 19=VWAP%
+      // 20=120D, 21=180D, 22=52W High, 23=52W Low
+      if (cols.length < 15) continue;
+
+      const symbolMatch = row.match(
+        /company\/([^"']+)/i
+      );
+      const symbol = symbolMatch
+        ? symbolMatch[1].toUpperCase()
+        : cols[1].replace(/\s+/g, "").toUpperCase();
+
+      const ltp = parseFloat(cols[6]?.replace(/,/g, "") || "0");
+      if (!symbol || !ltp || symbol.length > 20 || symbol.length < 2) continue;
+
+      const open = parseFloat(cols[3]?.replace(/,/g, "") || "0") || ltp;
+      const high = parseFloat(cols[4]?.replace(/,/g, "") || "0") || ltp;
+      const low = parseFloat(cols[5]?.replace(/,/g, "") || "0") || ltp;
+      const volume = parseFloat(cols[11]?.replace(/,/g, "") || "0") || 0;
+      const prevClose = parseFloat(cols[12]?.replace(/,/g, "") || "0") || ltp;
+      const turnover = parseFloat(cols[13]?.replace(/,/g, "") || "0") || 0;
+      const diff = parseFloat(cols[15]?.replace(/,/g, "") || "0") || 0;
+      const pctChange =
+        prevClose > 0 ? ((ltp - prevClose) / prevClose) * 100 : 0;
+
+      stocks.push({
+        symbol,
+        ltp,
+        change: diff || Math.round((ltp - prevClose) * 100) / 100,
+        percent_change: Math.round(pctChange * 100) / 100,
+        high,
+        low,
+        open,
+        volume,
+        turnover,
+        prev_close: prevClose,
+        source: "sharesansar",
+      });
+    }
+
+    if (stocks.length > 0) setCache("sharesansar:live", stocks, 45_000);
     return stocks;
   } catch (e) {
-    console.error("yonepse scrape error:", e);
+    console.error("sharesansar scrape error:", e);
     return [];
   }
 }
 
-// ─── Scraper: NepseAlpha (OHLCV history) ─────────────────────────────────────
+// ─── Scraper: NepseAlpha OHLCV ───────────────────────────────────────────────
 
-async function scrapeOhlcv(symbol: string, period: string): Promise<unknown[]> {
+async function scrapeOhlcv(
+  symbol: string,
+  period: string
+): Promise<unknown[]> {
   const cacheKey = `ohlcv:${symbol}:${period}`;
-  const cached = getCached(cacheKey, 300_000);
+  const cached = getCached(cacheKey);
   if (cached) return cached as unknown[];
 
-  const periodMap: Record<string, string> = { "1m": "1M", "3m": "3M", "6m": "6M", "1y": "1Y", "3y": "3Y", "5y": "5Y", "all": "MAX" };
-  const resolution = periodMap[period] || "1Y";
+  const now = Math.floor(Date.now() / 1000);
+  const fromMap: Record<string, number> = {
+    "1m": now - 30 * 86400,
+    "3m": now - 90 * 86400,
+    "6m": now - 180 * 86400,
+    "1y": now - 365 * 86400,
+    "3y": now - 3 * 365 * 86400,
+    "5y": now - 5 * 365 * 86400,
+  };
+  const from = fromMap[period] || now - 365 * 86400;
 
   try {
-    await delay(Math.random() * 500);
-    // Try nepsealpha TradingView-compatible API
-    const searchResp = await fetch(
-      `https://nepsealpha.com/trading/1/search?query=${encodeURIComponent(symbol)}&limit=1`,
-      { headers: { "User-Agent": randomUA(), "Accept": "application/json", "Origin": "https://nepsealpha.com" } }
-    );
-    if (!searchResp.ok) return [];
-    const searchData = await searchResp.json();
-    const ticker = searchData?.[0]?.ticker || searchData?.[0]?.symbol || symbol;
-
-    const now = Math.floor(Date.now() / 1000);
-    const fromMap: Record<string, number> = {
-      "1M": now - 30*86400, "3M": now - 90*86400, "6M": now - 180*86400,
-      "1Y": now - 365*86400, "3Y": now - 3*365*86400, "5Y": now - 5*365*86400, "MAX": 0,
-    };
-    const from = fromMap[resolution] || now - 365*86400;
-
+    await delay(Math.random() * 300);
     const histResp = await fetch(
-      `https://nepsealpha.com/trading/1/history?symbol=${encodeURIComponent(ticker)}&resolution=1D&from=${from}&to=${now}`,
-      { headers: { "User-Agent": randomUA(), "Accept": "application/json", "Origin": "https://nepsealpha.com" } }
+      `https://nepsealpha.com/trading/1/history?symbol=${encodeURIComponent(symbol)}&resolution=1D&from=${from}&to=${now}`,
+      {
+        headers: {
+          "User-Agent": randomUA(),
+          Accept: "application/json",
+          Origin: "https://nepsealpha.com",
+          Referer: "https://nepsealpha.com/",
+        },
+      }
     );
     if (!histResp.ok) return [];
-    const hist = await histResp.json();
+    const text = await histResp.text();
+    if (text.includes("<!DOCTYPE") || text.includes("cloudflare")) return [];
+    const hist = JSON.parse(text);
 
     if (hist.s !== "ok" || !hist.t) return [];
     const bars = hist.t.map((ts: number, i: number) => ({
       date: new Date(ts * 1000).toISOString().slice(0, 10),
-      timestamp: new Date(ts * 1000).toISOString(),
       open: hist.o[i],
       high: hist.h[i],
       low: hist.l[i],
@@ -175,12 +257,18 @@ async function scrapeOhlcv(symbol: string, period: string): Promise<unknown[]> {
     if (bars.length > 0) setCache(cacheKey, bars, 300_000);
     return bars;
   } catch (e) {
-    console.error("ohlcv scrape error:", e);
+    console.error("ohlcv error:", e);
     return [];
   }
 }
 
 // ─── Route Handler ───────────────────────────────────────────────────────────
+
+async function getLiveStocks(): Promise<Stock[]> {
+  let stocks = await scrapeSharesansar();
+  if (stocks.length === 0) stocks = await scrapeMerolagani();
+  return stocks;
+}
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -191,40 +279,110 @@ Deno.serve(async (req: Request) => {
   const path = url.pathname.replace(/^\/nepse-data\/?/, "/");
 
   try {
-    // /market/live - cascading scraper
+    // /market/live
     if (path === "/market/live" || path === "/") {
-      let stocks = await scrapeMerolagani();
-      if (stocks.length === 0) stocks = await scrapeYonepse();
-      return new Response(
-        JSON.stringify({ data: stocks, source: stocks.length > 0 ? (stocks[0] as Record<string,unknown>)?.source : "none", count: stocks.length }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      const stocks = await getLiveStocks();
+      return json({
+        data: stocks,
+        source: stocks.length > 0 ? stocks[0].source : "none",
+        count: stocks.length,
+        timestamp: new Date().toISOString(),
+      });
     }
 
     // /market/status
     if (path === "/market/status") {
       const now = new Date();
-      const nepseHour = now.getUTCHours() + 5.75;
-      const dayOfWeek = now.getDay();
-      const isOpen = dayOfWeek >= 0 && dayOfWeek <= 4 && nepseHour >= 11 && nepseHour <= 15;
-      return new Response(
-        JSON.stringify({ is_open: isOpen, nepal_time: `${Math.floor(nepseHour)}:${String(Math.round((nepseHour % 1) * 60)).padStart(2, "0")}`, day: dayOfWeek }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      const utcH = now.getUTCHours();
+      const utcM = now.getUTCMinutes();
+      const nstMinutes = utcH * 60 + utcM + 345; // UTC+5:45
+      const nstH = Math.floor(nstMinutes / 60) % 24;
+      const nstM = nstMinutes % 60;
+      const dayOfWeek = ((now.getUTCDay() + (nstMinutes >= 1440 ? 1 : 0)) % 7);
+      const isTradingDay = dayOfWeek >= 0 && dayOfWeek <= 4; // Sun-Thu
+      const isOpen =
+        isTradingDay && nstH >= 11 && (nstH < 15 || (nstH === 15 && nstM === 0));
+      return json({
+        is_open: isOpen,
+        nepal_time: `${nstH}:${String(nstM).padStart(2, "0")}`,
+        day: dayOfWeek,
+        trading_day: isTradingDay,
+      });
     }
 
     // /market/top
     if (path === "/market/top") {
-      let stocks = await scrapeMerolagani();
-      if (stocks.length === 0) stocks = await scrapeYonepse();
-      const typed = stocks as Array<Record<string, unknown>>;
-      const gainers = [...typed].sort((a, b) => Number(b.percent_change || 0) - Number(a.percent_change || 0)).slice(0, 10);
-      const losers = [...typed].sort((a, b) => Number(a.percent_change || 0) - Number(b.percent_change || 0)).slice(0, 10);
-      const byTurnover = [...typed].sort((a, b) => Number(b.turnover || 0) - Number(a.turnover || 0)).slice(0, 10);
-      return new Response(
-        JSON.stringify({ gainers, losers, turnover: byTurnover }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      const stocks = await getLiveStocks();
+      const gainers = [...stocks]
+        .sort((a, b) => b.percent_change - a.percent_change)
+        .slice(0, 10);
+      const losers = [...stocks]
+        .sort((a, b) => a.percent_change - b.percent_change)
+        .slice(0, 10);
+      const turnover = [...stocks]
+        .sort((a, b) => b.turnover - a.turnover)
+        .slice(0, 10);
+      return json({ gainers, losers, turnover });
+    }
+
+    // /market/sectors
+    if (path === "/market/sectors") {
+      const stocks = await getLiveStocks();
+      const sectorMap: Record<string, Stock[]> = {};
+      // Categorize by common NEPSE sector prefixes
+      const sectorRules: [string, RegExp][] = [
+        ["Commercial Banks", /^(NABIL|NICA|SBI|HBL|EBL|MBL|SANIMA|KBL|NMB|ADBL|PRVU|SBL|CZBIL|NBL|BOKL|PCBL|MEGA|LAXMI|SRBL|NCCB|GBIME|JBBL|NBB)/],
+        ["Development Banks", /^(MNBBL|SADBL|SHINE|MLBL|KSBBL|SAPDBL|CORBL|EDBL|GBBL|GRDBL|JBBL|KRBL|LBBL|MDB|NABBC)/],
+        ["Hydropower", /^(NHPC|BPCL|CHCL|API|AKPL|HDHPC|SHPC|SJCL|KPCL|RURU|UMRH|GHL|GLH|MHNL|NGPL|NHDL|RADHI|RIDI|SSHL|UNHPL|UPPER|UMHL)/],
+        ["Microfinance", /^(CBBL|DDBL|FOWAD|GILB|GBLBS|JSLB|KLBSL|LLBS|MLBSL|MSLB|NSLB|NLBBL|RMDC|RSDC|SABSL|SDLBSL|SKBBL|SLBSL|SMFDB|SWBBL|USLB|VLBS)/],
+        ["Life Insurance", /^(ALICL|CLI|GLICL|HGI|ILI|JLIC|LICN|NLICL|NLIC|PLI|PLIC|RLICL|SLICL|SJLIC|SLI|SNLICL|ULI)/],
+        ["Non-Life Insurance", /^(AIL|EIC|GIC|HEI|IGI|LGIL|NBIL|NEL|NIL|NICL|NLG|PICL|PRIN|RBCL|SAIL|SICL|SIL|SPIL|UIC)/],
+        ["Hotels & Tourism", /^(CGH|OHL|SHL|TRH|YHL|KDL)/],
+        ["Manufacturing", /^(BNT|BSM|FHL|HDL|JSM|NLO|RJM|SHIVM|UNL|NVG)/],
+      ];
+
+      for (const s of stocks) {
+        let placed = false;
+        for (const [sector, regex] of sectorRules) {
+          if (regex.test(s.symbol)) {
+            (sectorMap[sector] ||= []).push(s);
+            placed = true;
+            break;
+          }
+        }
+        if (!placed) (sectorMap["Others"] ||= []).push(s);
+      }
+
+      const sectors = Object.entries(sectorMap).map(([name, items]) => ({
+        name,
+        stocks: items.length,
+        turnover: items.reduce((sum, s) => sum + s.turnover, 0),
+        volume: items.reduce((sum, s) => sum + s.volume, 0),
+        change_pct:
+          items.length > 0
+            ? items.reduce((sum, s) => sum + s.percent_change, 0) / items.length
+            : 0,
+      }));
+
+      return json({ data: sectors });
+    }
+
+    // /market/depth/:symbol
+    const depthMatch = path.match(/^\/market\/depth\/([^/]+)$/);
+    if (depthMatch) {
+      return json({
+        bids: [],
+        asks: [],
+        message: "Real-time depth requires WebSocket connection to NEPSE",
+      });
+    }
+
+    // /market/floorsheet
+    if (path === "/market/floorsheet") {
+      return json({
+        data: [],
+        message: "Floorsheet available after market close from merolagani",
+      });
     }
 
     // /stocks/:symbol/prices
@@ -233,97 +391,185 @@ Deno.serve(async (req: Request) => {
       const symbol = decodeURIComponent(priceMatch[1]).toUpperCase();
       const period = url.searchParams.get("period") || "1y";
       const bars = await scrapeOhlcv(symbol, period);
-      return new Response(
-        JSON.stringify({ data: bars, symbol, count: bars.length }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      return json({ data: bars, symbol, count: bars.length });
     }
 
     // /health
     if (path === "/health") {
       const t0 = Date.now();
-      const stocks = await scrapeYonepse();
-      const latency = Date.now() - t0;
-      return new Response(
-        JSON.stringify({
-          sources: [
-            { source: "yonepse", status: stocks.length > 0 ? "ok" : "down", latency_ms: latency, stocks_count: stocks.length },
-            { source: "merolagani", status: "configured", latency_ms: null },
-            { source: "sharesansar", status: "configured", latency_ms: null },
-            { source: "nepsealpha", status: "configured", latency_ms: null },
-            { source: "sharehub", status: "configured", latency_ms: null },
-          ],
-        }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      const mero = await scrapeMerolagani();
+      const meroLatency = Date.now() - t0;
+      const t1 = Date.now();
+      const ss = await scrapeSharesansar();
+      const ssLatency = Date.now() - t1;
+
+      return json({
+        sources: [
+          {
+            name: "merolagani",
+            status: mero.length > 0 ? "ok" : "down",
+            latency_ms: meroLatency,
+            stocks_count: mero.length,
+          },
+          {
+            name: "sharesansar",
+            status: ss.length > 0 ? "ok" : "down",
+            latency_ms: ssLatency,
+            stocks_count: ss.length,
+          },
+          { name: "nepsealpha", status: "configured", latency_ms: null },
+          { name: "sharehub", status: "configured", latency_ms: null },
+          { name: "nepalipaisa", status: "configured", latency_ms: null },
+        ],
+      });
     }
 
     // /indices
     if (path === "/indices") {
-      const cached = getCached("indices", 60_000);
-      if (cached) {
-        return new Response(JSON.stringify({ data: cached }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
-      }
-      try {
-        const resp = await fetch(
-          "https://raw.githubusercontent.com/AashishBhandari535/nepse-json/refs/heads/main/index-values.json",
-          { headers: { "User-Agent": randomUA() } }
-        );
-        if (resp.ok) {
-          const json = await resp.json();
-          const indices = Array.isArray(json) ? json : json?.data || [];
-          setCache("indices", indices, 60_000);
-          return new Response(JSON.stringify({ data: indices }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
-        }
-      } catch (_) { /* fall through */ }
-      return new Response(JSON.stringify({ data: [] }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      const stocks = await getLiveStocks();
+      if (stocks.length === 0) return json({ data: [] });
+
+      const totalTurnover = stocks.reduce((s, st) => s + st.turnover, 0);
+      const avgChange =
+        stocks.reduce((s, st) => s + st.percent_change, 0) / stocks.length;
+
+      return json({
+        data: [
+          {
+            name: "NEPSE Index",
+            value: null,
+            change_pct: Math.round(avgChange * 100) / 100,
+            description: "Approximate from live stocks",
+          },
+          {
+            name: "Total Turnover",
+            value: Math.round(totalTurnover),
+            change_pct: 0,
+          },
+          { name: "Traded Stocks", value: stocks.length, change_pct: 0 },
+          {
+            name: "Advances",
+            value: stocks.filter((s) => s.percent_change > 0).length,
+            change_pct: 0,
+          },
+        ],
+      });
     }
 
-    // /recommendations - computed from live data
+    // /recommendations
     if (path === "/recommendations") {
-      let stocks = await scrapeMerolagani();
-      if (stocks.length === 0) stocks = await scrapeYonepse();
-      const typed = stocks as Array<Record<string, unknown>>;
-      const scored = typed
-        .filter((s) => Number(s.volume || 0) > 0 && Number(s.ltp || 0) > 0)
+      const stocks = await getLiveStocks();
+      const recs = stocks
+        .filter((s) => s.volume > 0 && s.ltp > 0)
         .map((s) => {
-          const pct = Number(s.percent_change || 0);
-          const vol = Number(s.volume || 0);
-          const score = pct * 0.4 + Math.log10(vol + 1) * 0.6;
-          return { ...s, score, recommendation: pct > 2 ? "BUY" : pct < -2 ? "AVOID" : "WATCH" };
+          const pct = s.percent_change;
+          let action: string;
+          let reason: string;
+          let confidence: number;
+
+          if (pct > 4) {
+            action = "BUY";
+            reason = `Strong momentum: +${pct.toFixed(1)}% with ${s.volume.toLocaleString()} volume`;
+            confidence = Math.min(85, 60 + pct * 3);
+          } else if (pct > 2) {
+            action = "BUY";
+            reason = `Positive trend: +${pct.toFixed(1)}% gain today`;
+            confidence = Math.min(70, 50 + pct * 5);
+          } else if (pct < -4) {
+            action = "SELL";
+            reason = `Sharp decline: ${pct.toFixed(1)}% - potential support breakdown`;
+            confidence = Math.min(80, 55 + Math.abs(pct) * 3);
+          } else if (pct < -2) {
+            action = "SELL";
+            reason = `Weakening: ${pct.toFixed(1)}% decline with selling pressure`;
+            confidence = Math.min(65, 45 + Math.abs(pct) * 4);
+          } else {
+            action = "HOLD";
+            reason = `Sideways movement: ${pct.toFixed(1)}%`;
+            confidence = 40;
+          }
+
+          return {
+            symbol: s.symbol,
+            action,
+            confidence: Math.round(confidence),
+            reason,
+            current_price: s.ltp,
+            target_price:
+              action === "BUY"
+                ? Math.round(s.ltp * 1.08)
+                : action === "SELL"
+                  ? Math.round(s.ltp * 0.95)
+                  : s.ltp,
+          };
         })
-        .sort((a, b) => b.score - a.score)
+        .filter((r) => r.action !== "HOLD")
+        .sort((a, b) => b.confidence - a.confidence)
         .slice(0, 20);
-      return new Response(
-        JSON.stringify({ data: scored }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+
+      return json({ data: recs });
     }
 
     // /bot/status
     if (path === "/bot/status") {
-      return new Response(
-        JSON.stringify({
-          scheduler: "active",
-          bots: [
-            { name: "EMA Crossover Bot", active: true, timeframe: "daily", last_run: new Date().toISOString() },
-            { name: "Momentum Bot", active: true, timeframe: "daily", last_run: new Date().toISOString() },
-            { name: "Volume Breakout Bot", active: true, timeframe: "daily", last_run: new Date().toISOString() },
-            { name: "Mean Reversion Bot", active: true, timeframe: "weekly", last_run: new Date().toISOString() },
-            { name: "SMC Bot", active: true, timeframe: "daily", last_run: new Date().toISOString() },
-            { name: "Sector Rotation Bot", active: true, timeframe: "monthly", last_run: new Date().toISOString() },
-          ],
-        }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      return json({
+        scheduler: "active",
+        bots: [
+          {
+            name: "EMA Crossover Bot",
+            status: "running",
+            strategy: "EMA 9/21 crossover",
+            last_run: new Date().toISOString(),
+            trades_today: 0,
+            pnl: 0,
+          },
+          {
+            name: "Momentum Bot",
+            status: "running",
+            strategy: "RSI + Volume breakout",
+            last_run: new Date().toISOString(),
+            trades_today: 0,
+            pnl: 0,
+          },
+          {
+            name: "Volume Breakout Bot",
+            status: "running",
+            strategy: "Volume surge detection",
+            last_run: new Date().toISOString(),
+            trades_today: 0,
+            pnl: 0,
+          },
+          {
+            name: "Mean Reversion Bot",
+            status: "running",
+            strategy: "Bollinger Band bounce",
+            last_run: new Date().toISOString(),
+            trades_today: 0,
+            pnl: 0,
+          },
+          {
+            name: "SMC Bot",
+            status: "running",
+            strategy: "Smart Money Concepts",
+            last_run: new Date().toISOString(),
+            trades_today: 0,
+            pnl: 0,
+          },
+          {
+            name: "Sector Rotation Bot",
+            status: "running",
+            strategy: "Sector momentum",
+            last_run: new Date().toISOString(),
+            trades_today: 0,
+            pnl: 0,
+          },
+        ],
+      });
     }
 
     // /bot/paper-trades
     if (path === "/bot/paper-trades") {
-      return new Response(
-        JSON.stringify({ data: [] }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      return json({ data: [] });
     }
 
     return new Response(
@@ -338,3 +584,9 @@ Deno.serve(async (req: Request) => {
     );
   }
 });
+
+function json(data: unknown): Response {
+  return new Response(JSON.stringify(data), {
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
