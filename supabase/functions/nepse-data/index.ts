@@ -222,6 +222,82 @@ async function scrapeSharesansar(): Promise<Stock[]> {
   }
 }
 
+// ─── Scraper: NepseAlpha Live Market ─────────────────────────────────────────
+// NepseAlpha's symbol_list is Cloudflare-protected, so we use their OHLCV
+// history API to get the latest close price for a list of known NEPSE symbols.
+// This is a fallback when ShareSansar and MeroLagani both fail.
+
+const NEPSE_SYMBOLS = [
+  "NABIL","NICA","SBI","HBL","EBL","MBL","SANIMA","KBL","NMB","ADBL","PRVU","SBL",
+  "CZBIL","BOKL","PCBL","MEGA","LAXMI","GBIME","CCBL","JBNL","LBL","SRBL","SINB",
+  "NHPC","BPCL","CHCL","API","AKPL","HDHPC","SHPC","SJCL","KPCL","UPPER","UMHL",
+  "RADHI","RIDI","GHL","GLH","MHNL","SPDL","NGPL","AHPC","AKJCL","ALBSL","ALICL",
+  "ANLB","APHL","BARUN","BGWT","BJHL","CBBL","DDBL","FMDBL","FOWAD","KLBSL",
+  "LLBS","MLBSL","MSLB","NMFBS","RSDC","SDESI","SLBS","SMFDB","SWBBL","UNLB",
+  "MNBBL","SADBL","SHINE","GBBL","EDBL","KSBBL","MLBL","JSLBB","SAPDBL","GRDBL",
+  "CORBL","NABBC","GUFL","ICFC","CFCL","GFCL","MFIL","SFCL","SIFC","PFL","RLFL",
+  "MPFL","CMB","NSLB","NLIC","PLIC","SICL","NLICL","HGI","IGI","LGIL","NIL",
+  "RBCL","PRIN","SIGS","SGIC","PICL","AIL","NECO",
+];
+
+async function scrapeNepseAlphaLive(): Promise<Stock[]> {
+  const cached = getCached("nepsealpha:live");
+  if (cached) return cached as Stock[];
+
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const from = now - 7 * 86400; // Last 7 days to get latest + prev close
+    const stocks: Stock[] = [];
+
+    // Fetch in batches of 10 to avoid rate limiting
+    for (let i = 0; i < NEPSE_SYMBOLS.length; i += 10) {
+      const batch = NEPSE_SYMBOLS.slice(i, i + 10);
+      const results = await Promise.allSettled(
+        batch.map(async (symbol) => {
+          const resp = await fetchWithRetry(
+            `https://nepsealpha.com/trading/1/history?symbol=${encodeURIComponent(symbol)}&resolution=1D&from=${from}&to=${now}`,
+            { headers: { Accept: "application/json", Origin: "https://nepsealpha.com", Referer: "https://nepsealpha.com/" } },
+            2
+          );
+          if (!resp) return null;
+          const text = await resp.text();
+          if (text.includes("<!DOCTYPE") || text.includes("cloudflare")) return null;
+          const hist = JSON.parse(text);
+          if (hist.s !== "ok" || !hist.t || hist.t.length === 0) return null;
+          const lastIdx = hist.t.length - 1;
+          const ltp = hist.c[lastIdx];
+          const prevClose = hist.c.length > 1 ? hist.c[lastIdx - 1] : ltp;
+          const pctChange = prevClose > 0 ? ((ltp - prevClose) / prevClose) * 100 : 0;
+          return {
+            symbol,
+            ltp,
+            change: Math.round((ltp - prevClose) * 100) / 100,
+            percent_change: Math.round(pctChange * 100) / 100,
+            high: hist.h[lastIdx],
+            low: hist.l[lastIdx],
+            open: hist.o[lastIdx],
+            volume: hist.v?.[lastIdx] || 0,
+            turnover: ltp * (hist.v?.[lastIdx] || 0),
+            prev_close: prevClose,
+            source: "nepsealpha",
+          } as Stock;
+        })
+      );
+      for (const r of results) {
+        if (r.status === "fulfilled" && r.value) stocks.push(r.value);
+      }
+      // Small delay between batches
+      if (i + 10 < NEPSE_SYMBOLS.length) await delay(200);
+    }
+
+    if (stocks.length > 0) setCache("nepsealpha:live", stocks, 45_000);
+    return stocks;
+  } catch (e) {
+    console.error("nepsealpha live error:", e);
+    return [];
+  }
+}
+
 // ─── Scraper: NepseAlpha OHLCV ───────────────────────────────────────────────
 
 async function scrapeOhlcv(
@@ -244,11 +320,20 @@ async function scrapeOhlcv(
   const from = fromMap[period] || now - 365 * 86400;
 
   try {
-    const histResp = await fetchWithRetry(
+    await delay(Math.random() * 200);
+    const histResp = await fetch(
       `https://nepsealpha.com/trading/1/history?symbol=${encodeURIComponent(symbol)}&resolution=1D&from=${from}&to=${now}`,
-      { headers: { Accept: "application/json", Origin: "https://nepsealpha.com", Referer: "https://nepsealpha.com/" } }
+      {
+        headers: {
+          "User-Agent": randomUA(),
+          Accept: "application/json",
+          "Accept-Language": "en-US,en;q=0.9",
+          Origin: "https://nepsealpha.com",
+          Referer: "https://nepsealpha.com/",
+        },
+      }
     );
-    if (!histResp) return [];
+    if (!histResp.ok) return [];
     const text = await histResp.text();
     if (text.includes("<!DOCTYPE") || text.includes("cloudflare")) return [];
     const hist = JSON.parse(text);
@@ -274,10 +359,12 @@ async function scrapeOhlcv(
 // ─── Route Handler ───────────────────────────────────────────────────────────
 
 async function getLiveStocks(): Promise<Stock[]> {
+  // Try ShareSansar first (most reliable), fall back to MeroLagani, then NepseAlpha
   let stocks = await scrapeSharesansar();
   if (stocks.length === 0) stocks = await scrapeMerolagani();
+  if (stocks.length === 0) stocks = await scrapeNepseAlphaLive();
   if (stocks.length === 0) {
-    // Third fallback: try sharesansar again after delay (sometimes first attempt gets rate limited)
+    // Last resort: retry ShareSansar after delay (sometimes rate limited on first attempt)
     await delay(2000);
     stocks = await scrapeSharesansar();
   }
@@ -399,13 +486,63 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    // /stocks/:symbol/prices
-    const priceMatch = path.match(/^\/stocks\/([^/]+)\/prices$/);
+    // /stocks/:symbol/prices  OR  /stock/:symbol/history
+    const priceMatch = path.match(/^\/stocks?\/([^/]+)\/(?:prices|history)$/);
     if (priceMatch) {
       const symbol = decodeURIComponent(priceMatch[1]).toUpperCase();
       const period = url.searchParams.get("period") || "1y";
       const bars = await scrapeOhlcv(symbol, period);
       return json({ data: bars, symbol, count: bars.length });
+    }
+
+    // /seed-history - Fetch and save historical data from NepseAlpha for top stocks
+    if (path === "/seed-history") {
+      const sbUrl = Deno.env.get("SUPABASE_URL")!;
+      const sbKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+      const dbH = { apikey: sbKey, Authorization: `Bearer ${sbKey}`, "Content-Type": "application/json" };
+      const period = url.searchParams.get("period") || "1y";
+      const symbolsParam = url.searchParams.get("symbols");
+      const symbols = symbolsParam
+        ? symbolsParam.split(",").map((s) => s.trim().toUpperCase())
+        : NEPSE_SYMBOLS;
+      let saved = 0, failed = 0;
+      const results: { symbol: string; bars: number; status: string }[] = [];
+
+      for (let i = 0; i < symbols.length; i += 5) {
+        const batch = symbols.slice(i, i + 5);
+        const batchResults = await Promise.allSettled(
+          batch.map(async (symbol) => {
+            const bars = await scrapeOhlcv(symbol, period);
+            if (bars.length === 0) return { symbol, bars: 0, status: "no_data" };
+            const allRows = (bars as { date: string; open: number; high: number; low: number; close: number; volume: number }[]).map((b) => ({
+              symbol, date: b.date, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume, percent_change: 0,
+            }));
+            // Save in chunks of 500 to avoid payload limits
+            let chunkSaved = 0;
+            for (let j = 0; j < allRows.length; j += 500) {
+              const chunk = allRows.slice(j, j + 500);
+              const r = await fetch(`${sbUrl}/rest/v1/stock_price_history`, {
+                method: "POST",
+                headers: { ...dbH, Prefer: "resolution=merge-duplicates,return=minimal" },
+                body: JSON.stringify(chunk),
+              });
+              if (r.ok) chunkSaved += chunk.length;
+            }
+            return { symbol, bars: bars.length, status: chunkSaved > 0 ? "saved" : "save_failed" };
+          })
+        );
+        for (const r of batchResults) {
+          if (r.status === "fulfilled") {
+            results.push(r.value);
+            if (r.value.status === "saved") saved++;
+            else failed++;
+          } else {
+            failed++;
+          }
+        }
+        if (i + 5 < symbols.length) await delay(300);
+      }
+      return json({ saved, failed, total: symbols.length, results: results.slice(0, 50) });
     }
 
     // /health
@@ -416,6 +553,9 @@ Deno.serve(async (req: Request) => {
       const t1 = Date.now();
       const ss = await scrapeSharesansar();
       const ssLatency = Date.now() - t1;
+      const t2 = Date.now();
+      const na = await scrapeNepseAlphaLive();
+      const naLatency = Date.now() - t2;
 
       return json({
         sources: [
@@ -431,7 +571,12 @@ Deno.serve(async (req: Request) => {
             latency_ms: ssLatency,
             stocks_count: ss.length,
           },
-          { name: "nepsealpha", status: "configured", latency_ms: null },
+          {
+            name: "nepsealpha",
+            status: na.length > 0 ? "ok" : "down",
+            latency_ms: naLatency,
+            stocks_count: na.length,
+          },
           { name: "sharehub", status: "configured", latency_ms: null },
           { name: "nepalipaisa", status: "configured", latency_ms: null },
         ],
