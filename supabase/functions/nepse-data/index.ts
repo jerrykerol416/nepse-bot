@@ -32,11 +32,7 @@ async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 3)
         headers: {
           ...options.headers,
           "User-Agent": randomUA(),
-          Accept: "text/html,application/xhtml+xml,application/json",
           "Accept-Language": "en-US,en;q=0.9",
-          "Cache-Control": "no-cache",
-          Pragma: "no-cache",
-          ...(attempt > 0 ? { "X-Forwarded-For": `10.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}` } : {}),
         },
       });
       if (resp.ok) return resp;
@@ -254,12 +250,20 @@ async function scrapeNepseAlphaLive(): Promise<Stock[]> {
       const batch = NEPSE_SYMBOLS.slice(i, i + 10);
       const results = await Promise.allSettled(
         batch.map(async (symbol) => {
-          const resp = await fetchWithRetry(
+          await delay(Math.random() * 200);
+          const resp = await fetch(
             `https://nepsealpha.com/trading/1/history?symbol=${encodeURIComponent(symbol)}&resolution=1D&from=${from}&to=${now}`,
-            { headers: { Accept: "application/json", Origin: "https://nepsealpha.com", Referer: "https://nepsealpha.com/" } },
-            2
+            {
+              headers: {
+                "User-Agent": randomUA(),
+                Accept: "application/json",
+                "Accept-Language": "en-US,en;q=0.9",
+                Origin: "https://nepsealpha.com",
+                Referer: "https://nepsealpha.com/",
+              },
+            }
           );
-          if (!resp) return null;
+          if (!resp.ok) return null;
           const text = await resp.text();
           if (text.includes("<!DOCTYPE") || text.includes("cloudflare")) return null;
           const hist = JSON.parse(text);

@@ -551,16 +551,16 @@ function getSignals(strategy: string, stocks: Stock[], hist: Map<string, HistDay
 
 // ─── Place a paper trade ────────────────────────────────────────────────────
 
-async function placeTrade(bot: BotConfig, sig: Signal): Promise<boolean> {
+async function placeTrade(bot: BotConfig, sig: Signal): Promise<number> {
   const riskPct = bot.parameters.risk_per_trade || 0.02;
   const riskAmount = bot.available_cash * riskPct;
   const slPrice = sig.price * (1 - sig.slPct / 100);
   const riskPerShare = sig.price - slPrice;
-  if (riskPerShare <= 0) return false;
+  if (riskPerShare <= 0) return 0;
 
   let qty = Math.floor(riskAmount / riskPerShare);
   qty = Math.min(qty, Math.floor(bot.available_cash / sig.price), 100);
-  if (qty <= 0) return false;
+  if (qty <= 0) return 0;
 
   const cost = qty * sig.price;
   const tgtPrice = sig.price * (1 + sig.tgtPct / 100);
@@ -578,7 +578,7 @@ async function placeTrade(bot: BotConfig, sig: Signal): Promise<boolean> {
     updated_at: new Date().toISOString(),
   });
 
-  return true;
+  return cost;
 }
 
 // ─── Check open trades for stoploss/target ──────────────────────────────────
@@ -772,8 +772,10 @@ Deno.serve(async (req: Request) => {
         for (const sig of signals) {
           const existing = (await dbGet<{ id: string }>(`paper_trades?bot_id=eq.${bot.id}&symbol=eq.${sig.symbol}&status=eq.open&select=id`)).length;
           if (existing > 0) continue;
-          if (await placeTrade(bot, sig)) {
+          const cost = await placeTrade(bot, sig);
+          if (cost > 0) {
             tradesPlaced++;
+            bot.available_cash -= cost;
           }
         }
       }
