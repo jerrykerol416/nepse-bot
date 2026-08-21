@@ -742,7 +742,7 @@ Deno.serve(async (req: Request) => {
     const stocks = await fetchLiveMarket();
 
     // Save daily prices for future analysis
-    if (stocks.length > 0) saveDailyPrices(stocks);
+    if (stocks.length > 0) await saveDailyPrices(stocks);
 
     if (stocks.length === 0) {
       await dbPost("bot_run_log", {
@@ -758,7 +758,8 @@ Deno.serve(async (req: Request) => {
 
     let tradesPlaced = 0, botsRun = 0;
 
-    if (marketOpen) {
+    const forceRun = new URL(req.url).searchParams.get("force") === "true";
+    if (marketOpen || forceRun) {
       const bots = await dbGet<BotConfig>("bot_configs?is_active=eq.true&select=*");
 
       for (const bot of bots) {
@@ -773,7 +774,6 @@ Deno.serve(async (req: Request) => {
           if (existing > 0) continue;
           if (await placeTrade(bot, sig)) {
             tradesPlaced++;
-            bot.available_cash -= sig.price * Math.floor((bot.available_cash * (bot.parameters.risk_per_trade || 0.02)) / ((sig.price * sig.slPct) / 100));
           }
         }
       }

@@ -23,6 +23,37 @@ function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 3): Promise<Response | null> {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      await delay(Math.random() * 300 + attempt * 500);
+      const resp = await fetch(url, {
+        ...options,
+        headers: {
+          ...options.headers,
+          "User-Agent": randomUA(),
+          Accept: "text/html,application/xhtml+xml,application/json",
+          "Accept-Language": "en-US,en;q=0.9",
+          "Cache-Control": "no-cache",
+          Pragma: "no-cache",
+          ...(attempt > 0 ? { "X-Forwarded-For": `10.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}` } : {}),
+        },
+      });
+      if (resp.ok) return resp;
+      if (resp.status === 429 || resp.status === 403) {
+        console.log(`Rate limited on ${url}, retry ${attempt + 1}/${maxRetries}`);
+        await delay(1000 * (attempt + 1));
+        continue;
+      }
+      return resp;
+    } catch (e) {
+      console.error(`Fetch error attempt ${attempt + 1}:`, e);
+      await delay(1000 * (attempt + 1));
+    }
+  }
+  return null;
+}
+
 const cache: Map<string, { data: unknown; expiry: number }> = new Map();
 
 function getCached(key: string): unknown | null {
@@ -57,15 +88,8 @@ async function scrapeMerolagani(): Promise<Stock[]> {
   if (cached) return cached as Stock[];
 
   try {
-    await delay(Math.random() * 200);
-    const resp = await fetch("https://merolagani.com/LatestMarket.aspx", {
-      headers: {
-        "User-Agent": randomUA(),
-        Accept: "text/html,application/xhtml+xml",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    });
-    if (!resp.ok) return [];
+    const resp = await fetchWithRetry("https://merolagani.com/LatestMarket.aspx", {});
+    if (!resp) return [];
     const html = await resp.text();
 
     const stocks: Stock[] = [];
@@ -135,15 +159,8 @@ async function scrapeSharesansar(): Promise<Stock[]> {
   if (cached) return cached as Stock[];
 
   try {
-    await delay(Math.random() * 300);
-    const resp = await fetch("https://www.sharesansar.com/today-share-price", {
-      headers: {
-        "User-Agent": randomUA(),
-        Accept: "text/html,application/xhtml+xml",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    });
-    if (!resp.ok) return [];
+    const resp = await fetchWithRetry("https://www.sharesansar.com/today-share-price", {});
+    if (!resp) return [];
     const html = await resp.text();
 
     const stocks: Stock[] = [];
@@ -227,19 +244,11 @@ async function scrapeOhlcv(
   const from = fromMap[period] || now - 365 * 86400;
 
   try {
-    await delay(Math.random() * 300);
-    const histResp = await fetch(
+    const histResp = await fetchWithRetry(
       `https://nepsealpha.com/trading/1/history?symbol=${encodeURIComponent(symbol)}&resolution=1D&from=${from}&to=${now}`,
-      {
-        headers: {
-          "User-Agent": randomUA(),
-          Accept: "application/json",
-          Origin: "https://nepsealpha.com",
-          Referer: "https://nepsealpha.com/",
-        },
-      }
+      { headers: { Accept: "application/json", Origin: "https://nepsealpha.com", Referer: "https://nepsealpha.com/" } }
     );
-    if (!histResp.ok) return [];
+    if (!histResp) return [];
     const text = await histResp.text();
     if (text.includes("<!DOCTYPE") || text.includes("cloudflare")) return [];
     const hist = JSON.parse(text);
@@ -267,6 +276,11 @@ async function scrapeOhlcv(
 async function getLiveStocks(): Promise<Stock[]> {
   let stocks = await scrapeSharesansar();
   if (stocks.length === 0) stocks = await scrapeMerolagani();
+  if (stocks.length === 0) {
+    // Third fallback: try sharesansar again after delay (sometimes first attempt gets rate limited)
+    await delay(2000);
+    stocks = await scrapeSharesansar();
+  }
   return stocks;
 }
 
@@ -715,6 +729,97 @@ Deno.serve(async (req: Request) => {
           }
         }
 
+        // === FALLBACK STRATEGIES (work with just 1 day of data) ===
+        // These use today's live market data when history is insufficient
+
+        // F1: Price-Volume Breakout (today's data only)
+        if (signals.length === 0 && stock.volume > 5000 && stock.percent_change > 3) {
+          const priceRange = (stock.high - stock.low) / (stock.low || 1);
+          const closeStrength = stock.high > stock.low ? (stock.ltp - stock.low) / (stock.high - stock.low) : 0.5;
+          if (closeStrength > 0.7 && priceRange > 0.03) {
+            signals.push({
+              action: "BUY",
+              confidence: Math.min(75, 55 + stock.percent_change * 2),
+              reason: `Price-volume breakout: +${stock.percent_change.toFixed(1)}% with ${stock.volume.toLocaleString()} volume, closing near high (${(closeStrength * 100).toFixed(0)}% of range)`,
+              strategy: "Volume Breakout",
+              target: Math.round(stock.ltp * 1.08),
+              stoploss: Math.round(stock.ltp * 0.96),
+            });
+          }
+        }
+
+        // F2: Gap Trading (today's open vs prev_close)
+        if (signals.length === 0 && stock.prev_close > 0 && stock.open > 0) {
+          const gapPct = ((stock.open - stock.prev_close) / stock.prev_close) * 100;
+          const heldGap = stock.ltp >= stock.open;
+          if (gapPct > 2 && heldGap && stock.volume > 2000) {
+            signals.push({
+              action: "BUY",
+              confidence: Math.min(72, 55 + gapPct * 2),
+              reason: `Gap up +${gapPct.toFixed(1)}% from ${stock.prev_close.toFixed(0)}, price holding above open`,
+              strategy: "Gap Trading",
+              target: Math.round(stock.ltp * 1.06),
+              stoploss: Math.round(stock.open * 0.98),
+            });
+          }
+        }
+
+        // F3: SMC Liquidity Grab (intraday pattern)
+        if (signals.length === 0 && stock.open > 0 && stock.low > 0 && stock.high > 0) {
+          const liquidityGrab = stock.low < stock.open && stock.ltp > stock.open;
+          const spread = stock.high - stock.low;
+          const bullishWick = spread > 0 ? (stock.open - stock.low) / spread > 0.4 : false;
+          if (liquidityGrab && bullishWick && stock.volume > 1000) {
+            signals.push({
+              action: "BUY",
+              confidence: 65,
+              reason: `Smart money liquidity grab: price dipped below open then recovered, bullish wick`,
+              strategy: "Smart Money (ICT)",
+              target: Math.round(stock.ltp * 1.05),
+              stoploss: Math.round(stock.low * 0.98),
+            });
+          }
+        }
+
+        // F4: Oversold Bounce (large decline with volume)
+        if (signals.length === 0 && stock.percent_change < -4 && stock.volume > 3000) {
+          const nearLow = stock.high > stock.low ? (stock.ltp - stock.low) / (stock.high - stock.low) > 0.3 : true;
+          if (nearLow) {
+            signals.push({
+              action: "BUY",
+              confidence: Math.min(70, 50 + Math.abs(stock.percent_change) * 2),
+              reason: `Oversold: ${stock.percent_change.toFixed(1)}% decline with ${stock.volume.toLocaleString()} volume - potential bounce`,
+              strategy: "Mean Reversion",
+              target: Math.round(stock.ltp * 1.05),
+              stoploss: Math.round(stock.ltp * 0.95),
+            });
+          }
+        }
+
+        // F5: Strong Momentum (simple but effective)
+        if (signals.length === 0 && stock.percent_change > 5 && stock.volume > 5000) {
+          signals.push({
+            action: "BUY",
+            confidence: Math.min(70, 50 + stock.percent_change * 2),
+            reason: `Strong momentum: +${stock.percent_change.toFixed(1)}% with high volume ${stock.volume.toLocaleString()}`,
+            strategy: "Momentum",
+            target: Math.round(stock.ltp * 1.07),
+            stoploss: Math.round(stock.ltp * 0.95),
+          });
+        }
+
+        // F6: Distribution Warning (large drop with high volume)
+        if (signals.length === 0 && stock.percent_change < -5 && stock.volume > 10000) {
+          signals.push({
+            action: "SELL",
+            confidence: Math.min(75, 55 + Math.abs(stock.percent_change) * 2),
+            reason: `Distribution: ${stock.percent_change.toFixed(1)}% drop on ${stock.volume.toLocaleString()} volume - institutional selling`,
+            strategy: "Volume Analysis",
+            target: Math.round(stock.ltp * 0.93),
+            stoploss: Math.round(stock.ltp * 1.03),
+          });
+        }
+
         // Pick the strongest signal for this stock
         if (signals.length > 0) {
           const best = signals.sort((a, b) => b.confidence - a.confidence)[0];
@@ -777,8 +882,8 @@ Deno.serve(async (req: Request) => {
           strategy: bot.strategy,
           status: bot.is_active ? "running" : "paused",
           budget: bot.budget,
-          risk_per_trade: bot.risk_per_trade,
-          max_positions: bot.max_positions,
+          risk_per_trade: (bot.parameters as Record<string, number>)?.risk_per_trade || 0.02,
+          max_positions: (bot.parameters as Record<string, number>)?.max_positions || 3,
           parameters: bot.parameters,
           last_run: lastRun ? lastRun.ran_at : null,
           stats: {
