@@ -34,10 +34,10 @@ class Settings(BaseSettings):
     host: str = Field(default="0.0.0.0", description="Server host")
     port: int = Field(default=8000, description="Server port")
     
-    # Database Configuration
+    # Database Configuration — defaults to Supabase connection pooler
     database_url: str = Field(
-        default="postgresql://postgres:postgres@localhost:5432/nepse_bot",
-        description="PostgreSQL connection string"
+        default="postgresql://postgres.jlazpkgsjouirindbylp:postgres@aws-0-us-east-1.pooler.supabase.com:6543/postgres",
+        description="PostgreSQL connection string (Supabase pooler)"
     )
     
     # Alternative database settings (for manual construction)
@@ -109,7 +109,7 @@ class Settings(BaseSettings):
     
     # CORS Configuration
     cors_origins: List[str] = Field(
-        default=["http://localhost:3000", "http://localhost:5173", "http://localhost:8000"],
+        default=["http://localhost:3000", "http://localhost:5173", "http://localhost:8000", "https://jlazpkgsjouirindbylp.supabase.co"],
         description="Allowed CORS origins"
     )
     

@@ -29,12 +29,14 @@ logger = logging.getLogger(__name__)
 # It maintains a pool of connections to the database
 engine = create_engine(
     settings.get_database_url(),
-    poolclass=QueuePool,  # Connection pooling for better performance
-    pool_size=5,  # Number of connections to maintain
-    max_overflow=10,  # Maximum number of connections that can be created beyond pool_size
-    pool_pre_ping=True,  # Verify connections before using them
-    pool_recycle=3600,  # Recycle connections after 1 hour
-    echo=False,  # Never echo raw SQL — %(param)s patterns break Python's log formatter
+    poolclass=QueuePool,
+    pool_size=5,
+    max_overflow=10,
+    pool_pre_ping=True,
+    pool_recycle=3600,
+    echo=False,
+    # Supabase pooler uses PgBouncer in transaction mode — disable prepared statements
+    connect_args={"prepared_statement_cache_size": 0, "statement_cache_size": 0},
 )
 
 # Create SessionLocal class
